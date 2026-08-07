@@ -1,8 +1,6 @@
 # ED Expedition Ledger
 
-<p align="center">
-  <img src="tracker.png" alt="ED Expedition Ledger compass icon" width="64">
-</p>
+<img src="icon.png" alt="ED Expedition Ledger" width="120">
 
 A configurable real-time journal watcher for multi-leg exploration expeditions
 in Elite Dangerous.
