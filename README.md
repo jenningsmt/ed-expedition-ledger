@@ -38,8 +38,8 @@ waypoint.
 2. Clone or download this repository somewhere permanent (the tracker writes
    `tracker.db` and `output/` relative to its own folder):
    ```
-   git clone https://github.com/jenningsmt/expedition-tracker.git C:\Tools\expedition-tracker
-   cd C:\Tools\expedition-tracker
+   git clone https://github.com/jenningsmt/ed-expedition-ledger.git C:\Tools\ed-expedition-ledger
+   cd C:\Tools\ed-expedition-ledger
    ```
 
 3. **Run the installer** — either double-click `install.bat` or:
