@@ -1,6 +1,6 @@
 @echo off
 echo.
-echo  Elite Dangerous Expedition Tracker -- Setup
+echo  ED Expedition Ledger -- Setup
 echo.
 
 where python >nul 2>&1

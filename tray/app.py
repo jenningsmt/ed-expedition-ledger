@@ -94,9 +94,9 @@ class TrackerTray:
 
         icon_img = _make_icon()
         self._icon = pystray.Icon(
-            name="ED Tracker",
+            name="ED Expedition Ledger",
             icon=icon_img,
-            title="ED Expedition Tracker",
+            title="ED Expedition Ledger",
             menu=Menu(
                 Item("Status",                self._show_status),
                 Item("Export snapshot",       self._export_snapshot),
@@ -129,7 +129,7 @@ class TrackerTray:
         self._update_tooltip(status)
         # Show a Windows balloon notification if possible.
         try:
-            icon.notify(status, title="ED Tracker")
+            icon.notify(status, title="ED Expedition Ledger")
         except Exception:
             pass
 
@@ -142,7 +142,7 @@ class TrackerTray:
             msg = f"Leg {closed_id} closed and exported."
             log.info(msg)
             try:
-                icon.notify(msg, title="ED Tracker")
+                icon.notify(msg, title="ED Expedition Ledger")
             except Exception:
                 pass
         self._update_tooltip()
@@ -151,7 +151,7 @@ class TrackerTray:
         leg = self._db.get_active_leg()
         if leg is None:
             try:
-                icon.notify("No active leg — nothing to snapshot.", title="ED Tracker")
+                icon.notify("No active leg — nothing to snapshot.", title="ED Expedition Ledger")
             except Exception:
                 pass
             return
@@ -162,13 +162,14 @@ class TrackerTray:
         ts     = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         suffix = f"_snapshot_{ts}"
         out    = Path(self._cfg["output_dir"])
+        wp     = self._waypoint_systems()
         try:
-            xlsx_path = export_leg(leg["leg_id"], self._db, out, suffix=suffix)
-            export_master_rollup(self._db, out)
+            xlsx_path = export_leg(leg["leg_id"], self._db, out, suffix=suffix, waypoint_systems=wp)
+            export_master_rollup(self._db, out, waypoint_systems=wp)
             msg = f"Snapshot saved: {xlsx_path.name}"
             log.info(msg)
             try:
-                icon.notify(msg, title="ED Tracker")
+                icon.notify(msg, title="ED Expedition Ledger")
             except Exception:
                 pass
             import os
@@ -193,11 +194,19 @@ class TrackerTray:
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
+    def _waypoint_systems(self) -> "set[str] | None":
+        """Normalised waypoint system names when config.toml's
+        waypoints_only_export is true, else None (unfiltered exports)."""
+        if not self._cfg.get("waypoints_only_export", False):
+            return None
+        return set(self._cfg.get("waypoint_map", {}).keys())
+
     def _export_leg(self, leg_id: int) -> None:
         try:
             out = Path(self._cfg["output_dir"])
-            export_leg(leg_id, self._db, out)
-            export_master_rollup(self._db, out)
+            wp  = self._waypoint_systems()
+            export_leg(leg_id, self._db, out, waypoint_systems=wp)
+            export_master_rollup(self._db, out, waypoint_systems=wp)
         except Exception:
             log.exception("Export failed for leg %d.", leg_id)
 
@@ -206,7 +215,7 @@ class TrackerTray:
             text = self._legs.status_text()
         if self._icon:
             try:
-                self._icon.title = f"ED Tracker — {text}"
+                self._icon.title = f"ED Expedition Ledger — {text}"
             except Exception:
                 pass
 

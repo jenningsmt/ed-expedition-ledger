@@ -49,7 +49,7 @@ def _write_config(path: Path, data: dict) -> None:
     rarity = _rarity_block(path)
 
     lines = [
-        "# Elite Dangerous Expedition Tracker",
+        "# ED Expedition Ledger",
         "# Edit this file to define your expedition, then launch tracker.pyw.",
         "",
         "# ── Journal source ────────────────────────────────────────────────────────────",

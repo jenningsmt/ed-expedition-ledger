@@ -1,5 +1,5 @@
 """
-One-time setup for the Elite Dangerous Expedition Tracker.
+One-time setup for ED Expedition Ledger.
 
   Windows:  double-click install.bat
             or: python install.py
@@ -21,7 +21,7 @@ _FAIL = "  [XX]  "
 def _header() -> None:
     print()
     print(_SEP)
-    print("   Elite Dangerous Expedition Tracker — Setup")
+    print("   ED Expedition Ledger — Setup")
     print(_SEP)
     print()
 
@@ -68,7 +68,7 @@ def _create_shortcut() -> None:
         print(f"       {result.stderr.strip()}")
         print(f"       Run 'python make_shortcut.py' manually to retry.")
     else:
-        print(f"{_TICK}Desktop shortcut created (ED Tracker.lnk)")
+        print(f"{_TICK}Desktop shortcut created (ED Expedition Ledger.lnk)")
 
 
 def _open_config() -> None:
@@ -91,7 +91,7 @@ def _footer() -> None:
     print("  and expedition route, then click Save.")
     print()
     print("  To start a session:")
-    print("    double-click 'ED Tracker' on your Desktop")
+    print("    double-click 'ED Expedition Ledger' on your Desktop")
     print("    — or —")
     print("    pythonw tracker.pyw")
     print()

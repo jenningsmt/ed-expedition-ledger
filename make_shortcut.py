@@ -76,7 +76,7 @@ def _get_desktop() -> Path:
 
 def _create_shortcut(pythonw: str) -> None:
     desktop = _get_desktop()
-    lnk     = desktop / "ED Tracker.lnk"
+    lnk     = desktop / "ED Expedition Ledger.lnk"
     icon_str = str(ICON) if ICON.exists() else ""
 
     ps_script = f"""
@@ -85,7 +85,7 @@ $sc = $ws.CreateShortcut('{lnk}')
 $sc.TargetPath      = '{pythonw}'
 $sc.Arguments       = '"{SCRIPT}"'
 $sc.WorkingDirectory= '{ROOT}'
-$sc.Description     = 'Elite Dangerous Expedition Tracker'
+$sc.Description     = 'ED Expedition Ledger'
 {f"$sc.IconLocation   = '{icon_str}'" if icon_str else ""}
 $sc.Save()
 Write-Output 'Shortcut created at {lnk}'

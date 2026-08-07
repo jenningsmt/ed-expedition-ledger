@@ -1,4 +1,8 @@
-# Elite Dangerous Expedition Tracker
+# ED Expedition Ledger
+
+<p align="center">
+  <img src="tracker.png" alt="ED Expedition Ledger compass icon" width="64">
+</p>
 
 A configurable real-time journal watcher for multi-leg exploration expeditions
 in Elite Dangerous.
@@ -92,7 +96,7 @@ Run once (needs Pillow, which is already in requirements):
 python make_shortcut.py
 ```
 
-This creates `%USERPROFILE%\Desktop\ED Tracker.lnk` pointing to
+This creates `%USERPROFILE%\Desktop\ED Expedition Ledger.lnk` pointing to
 `pythonw.exe tracker.pyw` with a compass-rose icon and the correct working
 directory.
 
@@ -154,6 +158,39 @@ DB is cleanly closed and no partial writes are left.
 Open `config.toml` and edit the `[[waypoints]]` blocks. System names are
 matched **case-insensitively** against `FSDJump.StarSystem`, so capitalisation
 doesn't matter. Restart the tracker for changes to take effect.
+
+---
+
+## Waypoint-only exports
+
+For a checklist-style survey expedition -- e.g. verifying a list of candidate
+systems from an external source rather than exploring a contiguous route --
+you often want exports to cover only the designated waypoints, not every
+system transited between them. Set in `config.toml`:
+
+```toml
+waypoints_only_export = true
+```
+
+With this on, every export (per-leg xlsx/CSVs and `master_rollup.xlsx`)
+restricts **Systems, Bodies, Terraformable & Notable, Body Classes, Organics,
+Codex Firsts, and Rare Finds** to just the systems listed under
+`[[waypoints]]`. Each export's Summary sheet gets a `Note` row confirming
+this is active and how many systems it covers.
+
+**Sales figures are the one exception** — Cartographics and Exo-Bio sales
+always cover the whole leg/expedition regardless of this setting, because
+Frontier's own `MultiSellExplorationData`/`SellOrganicData` journal events
+don't record per-system or per-sale-item earnings breakdowns. The tracker
+already records *which* systems contributed to a cartographics sale (see
+the `sales_cartographics_systems` table), but not each one's share of the
+total credits, so there's no reliable way to isolate "sales earned from
+waypoint systems only" — the underlying data to do that correctly doesn't
+exist in the journal. Treat sales totals as whole-leg/whole-expedition even
+with `waypoints_only_export` on.
+
+Default is `false` (unset behaves the same way) — existing configs and
+route-based expeditions are unaffected.
 
 ---
 
