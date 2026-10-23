@@ -30,8 +30,30 @@ def load(config_path: Path) -> dict:
     raw["journal_dir"] = _expand(raw["journal_dir"], root)
     raw["output_dir"]  = _expand(raw["output_dir"],  root)
     raw["db_path"]     = _expand(raw["db_path"],      root)
+    raw["baseline_path"] = _expand(
+        raw.get("baseline_path", "validation_baseline.json"), root
+    )
 
     raw["output_dir"].mkdir(parents=True, exist_ok=True)
+
+    # ── Commanders ─────────────────────────────────────────────────────────────
+    # `commanders = [...]` tracks several CMDRs sharing one journal folder;
+    # the older single `commander = '...'` key is still accepted.
+    if "commanders" not in raw:
+        raw["commanders"] = [raw["commander"]]
+    raw.setdefault("commander", raw["commanders"][0])
+
+    # ── Mode ───────────────────────────────────────────────────────────────────
+    # "waypoints" (default): legs close at configured waypoints.
+    # "sector": one open leg for a sector survey; exports are cumulative and
+    # named sector_<sector>_<as-of date>.  Optional [survey] block points at a
+    # sector-surveyor candidate CSV to keep up to date.
+    raw.setdefault("mode", "waypoints")
+    if raw["mode"] == "sector" and not raw.get("sector"):
+        raise ValueError("mode = 'sector' requires a `sector` name in the config.")
+    survey = raw.get("survey")
+    if survey and survey.get("csv_path"):
+        survey["csv_path"] = _expand(survey["csv_path"], root)
 
     # ── Timestamp cutoff ───────────────────────────────────────────────────────
     raw["expedition_start_dt"] = datetime.fromisoformat(
@@ -42,6 +64,7 @@ def load(config_path: Path) -> dict:
     for wp in raw.get("waypoints", []):
         wp["system_norm"] = wp["system"].lower().strip()
 
+    raw.setdefault("expedition_end_system", "")
     raw["expedition_end_system_norm"] = raw["expedition_end_system"].lower().strip()
     raw["expedition_start_system_norm"] = raw.get(
         "expedition_start_system", ""

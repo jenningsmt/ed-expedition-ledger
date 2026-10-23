@@ -24,7 +24,8 @@ from engine.db       import Database
 from engine.legs     import LegManager
 from engine.parser   import EventParser
 from engine.watcher  import JournalWatcher
-from engine.exporter import export_leg, export_master_rollup
+from engine.exporter import export_for_config
+from engine.survey   import SurveyTracker
 
 if TYPE_CHECKING:
     pass
@@ -68,9 +69,18 @@ class TrackerTray:
         self._cfg  = cfg
         self._db   = db
         self._legs = LegManager(db, cfg)
+        self._sector_mode = cfg.get("mode") == "sector"
+        survey_cfg = cfg.get("survey") or {}
+        self._survey: SurveyTracker | None = None
+        if survey_cfg.get("csv_path"):
+            self._survey = SurveyTracker(
+                survey_cfg["csv_path"], cfg["sector"], on_write_blocked=self._notify,
+            )
         self._parser = EventParser(
             db, self._legs, cfg,
             on_leg_close=self._on_leg_close,
+            survey=self._survey,
+            on_session_end=self._on_session_end if self._sector_mode else None,
         )
         self._watcher = JournalWatcher(
             journal_dir=Path(cfg["journal_dir"]),
@@ -99,10 +109,15 @@ class TrackerTray:
             title="ED Expedition Ledger",
             menu=Menu(
                 Item("Status",                self._show_status),
+                Item("Survey progress",       self._show_survey,
+                     visible=self._survey is not None),
                 Item("Export snapshot",       self._export_snapshot),
-                Item("Close leg & export now", self._manual_close),
+                Item("Close leg & export now", self._manual_close,
+                     visible=not self._sector_mode),
                 Menu.SEPARATOR,
-                Item("Configure expedition…", self._open_config),
+                # The config window edits config.toml only, not a sector config.
+                Item("Configure expedition…", self._open_config,
+                     visible=not self._sector_mode),
                 Menu.SEPARATOR,
                 Item("Stop & exit",           self._stop_and_exit),
             ),
@@ -114,7 +129,15 @@ class TrackerTray:
 
     def _backfill_then_start(self) -> None:
         try:
+            if self._survey:
+                self._survey.autoflush = False
             self._watcher.backfill()
+            if self._survey:
+                self._survey.autoflush = True
+                self._survey.flush()
+            self._parser.live = True
+            if self._sector_mode:
+                self._export_active()
             self._watcher.start()
             self._update_tooltip()
         except Exception:
@@ -132,6 +155,10 @@ class TrackerTray:
             icon.notify(status, title="ED Expedition Ledger")
         except Exception:
             pass
+
+    def _show_survey(self, icon, item) -> None:
+        if self._survey:
+            self._notify(self._survey.summary_text())
 
     def _manual_close(self, icon, item) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -156,16 +183,11 @@ class TrackerTray:
                 pass
             return
 
-        from engine.rarity import run_rarity_pass
-        run_rarity_pass(self._db, self._cfg.get("rarity", {}))
-
         ts     = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         suffix = f"_snapshot_{ts}"
         out    = Path(self._cfg["output_dir"])
-        wp     = self._waypoint_systems()
         try:
-            xlsx_path = export_leg(leg["leg_id"], self._db, out, suffix=suffix, waypoint_systems=wp)
-            export_master_rollup(self._db, out, waypoint_systems=wp)
+            xlsx_path = export_for_config(self._cfg, self._db, leg["leg_id"], suffix=suffix)
             msg = f"Snapshot saved: {xlsx_path.name}"
             log.info(msg)
             try:
@@ -194,25 +216,34 @@ class TrackerTray:
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _waypoint_systems(self) -> "set[str] | None":
-        """Normalised waypoint system names when config.toml's
-        waypoints_only_export is true, else None (unfiltered exports)."""
-        if not self._cfg.get("waypoints_only_export", False):
-            return None
-        return set(self._cfg.get("waypoint_map", {}).keys())
+    def _on_session_end(self) -> None:
+        """Game Shutdown event (sector mode): refresh the as-of export."""
+        self._export_active()
+
+    def _export_active(self) -> None:
+        leg = self._db.get_active_leg()
+        if leg is not None:
+            self._export_leg(leg["leg_id"])
 
     def _export_leg(self, leg_id: int) -> None:
         try:
-            out = Path(self._cfg["output_dir"])
-            wp  = self._waypoint_systems()
-            export_leg(leg_id, self._db, out, waypoint_systems=wp)
-            export_master_rollup(self._db, out, waypoint_systems=wp)
+            export_for_config(self._cfg, self._db, leg_id)
         except Exception:
             log.exception("Export failed for leg %d.", leg_id)
+
+    def _notify(self, msg: str) -> None:
+        log.info(msg)
+        if self._icon:
+            try:
+                self._icon.notify(msg, title="ED Expedition Ledger")
+            except Exception:
+                pass
 
     def _update_tooltip(self, text: str | None = None) -> None:
         if text is None:
             text = self._legs.status_text()
+            if self._survey:
+                text += f"  |  Survey {self._survey.summary()['completed']} done"
         if self._icon:
             try:
                 self._icon.title = f"ED Expedition Ledger — {text}"
@@ -222,5 +253,9 @@ class TrackerTray:
     def _shutdown(self) -> None:
         log.info("Flushing and shutting down …")
         self._watcher.stop()
+        if self._survey:
+            self._survey.close()
+        if self._sector_mode:
+            self._export_active()
         self._db.close()
         log.info("Clean shutdown complete.")

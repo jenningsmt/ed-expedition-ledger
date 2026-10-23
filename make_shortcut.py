@@ -4,9 +4,13 @@ Also saves a companion icon (.ico) next to the script.
 
 Run once:
   python make_shortcut.py
+
+For a second expedition config (e.g. a sector survey):
+  python make_shortcut.py --config config_hypiae_aim.toml --name "ED Ledger - Hypiae Aim"
 """
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -74,18 +78,20 @@ def _get_desktop() -> Path:
         return Path(os.path.expandvars("%USERPROFILE%")) / "Desktop"
 
 
-def _create_shortcut(pythonw: str) -> None:
+def _create_shortcut(pythonw: str, name: str = "ED Expedition Ledger",
+                     config: "str | None" = None) -> None:
     desktop = _get_desktop()
-    lnk     = desktop / "ED Expedition Ledger.lnk"
+    lnk     = desktop / f"{name}.lnk"
     icon_str = str(ICON) if ICON.exists() else ""
+    args = f'"{SCRIPT}"' + (f' --config "{(ROOT / config).resolve()}"' if config else "")
 
     ps_script = f"""
 $ws = New-Object -ComObject WScript.Shell
 $sc = $ws.CreateShortcut('{lnk}')
 $sc.TargetPath      = '{pythonw}'
-$sc.Arguments       = '"{SCRIPT}"'
+$sc.Arguments       = '{args}'
 $sc.WorkingDirectory= '{ROOT}'
-$sc.Description     = 'ED Expedition Ledger'
+$sc.Description     = '{name}'
 {f"$sc.IconLocation   = '{icon_str}'" if icon_str else ""}
 $sc.Save()
 Write-Output 'Shortcut created at {lnk}'
@@ -103,10 +109,15 @@ Write-Output 'Shortcut created at {lnk}'
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description="Create a Desktop shortcut for the tracker.")
+    ap.add_argument("--config", help="Expedition config file (default: config.toml)")
+    ap.add_argument("--name", default="ED Expedition Ledger", help="Shortcut name")
+    args = ap.parse_args()
+
     _write_icon()
     pythonw = _find_pythonw()
     print(f"pythonw.exe -> {pythonw}")
-    _create_shortcut(pythonw)
+    _create_shortcut(pythonw, args.name, args.config)
     print("Done.  You can now launch the tracker from the Desktop shortcut.")
 
 

@@ -33,6 +33,12 @@ def _waypoint_filter(column: str, waypoint_systems: "set[str] | None") -> "tuple
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
 
+# (table, column) pairs added after the original schema; _init() ALTERs them in.
+_ADDED_COLUMNS = [
+    ("systems", "commander"),
+    ("bodies",  "commander"),
+]
+
 _DDL = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -106,7 +112,8 @@ CREATE TABLE IF NOT EXISTS systems (
     first_visit_ts  TEXT,
     body_count      INTEGER,
     fully_scanned   INTEGER NOT NULL DEFAULT 0,
-    leg_id          INTEGER REFERENCES legs(leg_id)
+    leg_id          INTEGER REFERENCES legs(leg_id),
+    commander       TEXT
 );
 
 -- One row per body per system; first scan wins.
@@ -124,6 +131,7 @@ CREATE TABLE IF NOT EXISTS bodies (
     was_mapped               INTEGER NOT NULL DEFAULT 1,
     surface_mapped           INTEGER NOT NULL DEFAULT 0,
     leg_id                   INTEGER REFERENCES legs(leg_id),
+    commander                TEXT,
     UNIQUE(system, body_id)
 );
 CREATE INDEX IF NOT EXISTS idx_bodies_leg ON bodies(leg_id);
@@ -230,6 +238,11 @@ class Database:
     def _init(self) -> None:
         with self._lock:
             self._conn.executescript(_DDL)
+            # Migrations for databases created before a column existed.
+            for table, column in _ADDED_COLUMNS:
+                cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+                if column not in cols:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -402,16 +415,17 @@ class Database:
         star_pos: list,
         visit_ts: str,
         leg_id: int | None,
+        commander: str | None = None,
     ) -> None:
         x, y, z = (star_pos + [None, None, None])[:3]
         with self._lock:
             self._exec(
                 """INSERT INTO systems
                    (system_name,system_address,star_pos_x,star_pos_y,star_pos_z,
-                    first_visit_ts,leg_id)
-                   VALUES(?,?,?,?,?,?,?)
+                    first_visit_ts,leg_id,commander)
+                   VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(system_name) DO NOTHING""",
-                (system_name, system_address, x, y, z, visit_ts, leg_id),
+                (system_name, system_address, x, y, z, visit_ts, leg_id, commander),
             )
 
     def update_system_body_count(self, system_name: str, body_count: int) -> None:
@@ -443,17 +457,18 @@ class Database:
         was_discovered: bool,
         was_mapped: bool,
         leg_id: int | None,
+        commander: str | None = None,
     ) -> None:
         with self._lock:
             self._exec(
                 """INSERT OR IGNORE INTO bodies
                    (ts,system,body_name,body_id,body_class,terraform_state,landable,
-                    distance_from_arrival_ls,was_discovered,was_mapped,leg_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    distance_from_arrival_ls,was_discovered,was_mapped,leg_id,commander)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     ts, system, body_name, body_id, body_class,
                     terraform_state or "", int(landable),
-                    distance_ls, int(was_discovered), int(was_mapped), leg_id,
+                    distance_ls, int(was_discovered), int(was_mapped), leg_id, commander,
                 ),
             )
 
@@ -671,6 +686,29 @@ class Database:
             return self._exec(
                 "SELECT raw_json FROM events_raw WHERE event=?", (event_type,)
             ).fetchall()
+
+    def get_events_raw_ordered(self, event_types: "tuple[str, ...]") -> "list[tuple]":
+        """(event, raw_json) for the given event types, oldest first."""
+        placeholders = ",".join("?" for _ in event_types)
+        with self._lock:
+            return self._exec(
+                f"SELECT event, raw_json FROM events_raw WHERE event IN ({placeholders}) "
+                "ORDER BY ts, id",
+                event_types,
+            ).fetchall()
+
+    def get_last_session_commander(self) -> str | None:
+        """CMDR name from the most recent Commander / LoadGame event."""
+        import json as _json
+        with self._lock:
+            row = self._exec(
+                "SELECT event, raw_json FROM events_raw "
+                "WHERE event IN ('Commander','LoadGame') ORDER BY ts DESC, id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        ev = _json.loads(row["raw_json"])
+        return ev.get("Name") if row["event"] == "Commander" else ev.get("Commander")
 
     def get_geo_signal_count(self, system: str, body_name: str) -> int:
         """Return geological signal count for this body (0 if none recorded)."""

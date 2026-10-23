@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import openpyxl
@@ -80,6 +81,11 @@ def _leg_slug(leg) -> str:
     return f"Leg{leg['ordinal']:02d}_{name}_{date}"
 
 
+def sector_slug(sector: str, as_of: str) -> str:
+    """File stem for a sector-survey export, e.g. sector_hypiae_aim_2026-10-23."""
+    return f"sector_{sector.lower().strip().replace(' ', '_')}_{as_of}"
+
+
 def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
     ws = wb.create_sheet(name)
     ws.append(headers)
@@ -95,11 +101,15 @@ def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
 # ── Main entry points ──────────────────────────────────────────────────────────
 
 def export_leg(leg_id: int, db: Database, output_dir: Path,
-               suffix: str = "", waypoint_systems: "set[str] | None" = None) -> Path:
+               suffix: str = "", waypoint_systems: "set[str] | None" = None,
+               slug: "str | None" = None, as_of: "str | None" = None) -> Path:
     """Export one leg to xlsx + CSVs.  Returns the xlsx path.
 
     Pass suffix (e.g. '_snapshot_20260603T014500') to distinguish an
     on-demand snapshot from the final waypoint-close export.
+
+    Pass slug to override the file stem entirely (sector mode), and as_of
+    to add an "As of (UTC)" row to the Summary sheet.
 
     Pass waypoint_systems (normalised/lowercased system names, from
     cfg["waypoint_map"] when config.toml's waypoints_only_export is true) to
@@ -113,7 +123,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     if leg is None:
         raise ValueError(f"Leg {leg_id} not found in DB.")
 
-    slug   = _leg_slug(leg) + suffix
+    slug   = slug or (_leg_slug(leg) + suffix)
     xlsx_p = output_dir / f"{slug}.xlsx"
     wb     = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -132,6 +142,8 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         ("End system",           leg["end_system"] or "—"),
         ("End time (UTC)",       leg["end_ts"] or "—"),
     ]
+    if as_of:
+        summary_rows.append(("As of (UTC)", as_of))
     if waypoint_systems:
         summary_rows.append((
             "Note",
@@ -187,14 +199,14 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     # ── Systems sheet ──────────────────────────────────────────────────────────
     sys_headers = [
         "System", "First Visit (UTC)", "Body Count", "Fully Scanned",
-        "Star Pos X", "Star Pos Y", "Star Pos Z",
+        "Star Pos X", "Star Pos Y", "Star Pos Z", "Commander",
     ]
     sys_rows = []
     for s in db.get_systems_for_leg(leg_id, waypoint_systems):
         sys_rows.append([
             s["system_name"], s["first_visit_ts"], s["body_count"],
             "Yes" if s["fully_scanned"] else "No",
-            s["star_pos_x"], s["star_pos_y"], s["star_pos_z"],
+            s["star_pos_x"], s["star_pos_y"], s["star_pos_z"], s["commander"] or "",
         ])
     _add_sheet(wb, "Systems", sys_headers, sys_rows)
     _write_csv(output_dir / f"{slug}_systems.csv", sys_headers, sys_rows)
@@ -203,6 +215,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     body_headers = [
         "System", "Body Name", "Body ID", "Class", "Terraform State",
         "Landable", "Dist LS", "First Discovery", "Pre-Mapped", "Surface Mapped",
+        "Commander",
     ]
     body_rows = []
     for b in db.get_bodies_for_leg(leg_id, waypoint_systems):
@@ -214,6 +227,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
             "Yes" if not b["was_discovered"] else "No",
             "Yes" if not b["was_mapped"] else "No",
             "Yes" if b["surface_mapped"] else "No",
+            b["commander"] or "",
         ])
     _add_sheet(wb, "Bodies", body_headers, body_rows)
     _write_csv(output_dir / f"{slug}_bodies.csv", body_headers, body_rows)
@@ -469,4 +483,27 @@ def export_master_rollup(
 
     wb.save(str(xlsx_p))
     log.info("Master rollup written -> %s", xlsx_p.name)
+    return xlsx_p
+
+
+def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "") -> Path:
+    """Run the rarity pass, then export one leg + the master rollup using the
+    naming and filter rules from cfg.  Returns the leg xlsx path.
+
+    Waypoint mode: Leg##_<name>_<start date><suffix>.
+    Sector mode:   sector_<sector>_<as-of date> — cumulative, so re-exporting
+                   on the same UTC day overwrites that day's files.
+    """
+    from .rarity import run_rarity_pass
+    run_rarity_pass(db, cfg.get("rarity", {}))
+
+    out = Path(cfg["output_dir"])
+    wp  = set(cfg["waypoint_map"]) if cfg.get("waypoints_only_export", False) else None
+    if cfg.get("mode") == "sector":
+        as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        xlsx_p = export_leg(leg_id, db, out, waypoint_systems=wp,
+                            slug=sector_slug(cfg["sector"], as_of), as_of=as_of)
+    else:
+        xlsx_p = export_leg(leg_id, db, out, suffix=suffix, waypoint_systems=wp)
+    export_master_rollup(db, out, waypoint_systems=wp)
     return xlsx_p

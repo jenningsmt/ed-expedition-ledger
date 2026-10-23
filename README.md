@@ -21,6 +21,8 @@ waypoint.
 | `engine/` | Core engine — fully testable without the tray |
 | `tray/app.py` | Thin pystray shell over the engine |
 | `config.toml` | All user-editable settings |
+| `config_hypiae_aim.toml` | Sector-survey config (see [Sector survey mode](#sector-survey-mode)) |
+| `data/sector-surveyor_output/` | Sector-surveyor candidate CSVs the survey keeps updated |
 | `requirements.txt` | Pinned Python dependencies |
 | `make_shortcut.py` | Creates a Desktop .lnk shortcut |
 | `tests/` | pytest suite (unit + full-expedition validation) |
@@ -189,6 +191,95 @@ with `waypoints_only_export` on.
 
 Default is `false` (unset behaves the same way) — existing configs and
 route-based expeditions are unaffected.
+
+---
+
+## Sector survey mode
+
+For surveying a whole sector rather than flying to waypoints — e.g. working
+through a sector-surveyor list of systems that likely
+exist but have never been reported to EDSM. A ready-made config is
+`config_hypiae_aim.toml`; run it alongside (not instead of) a waypoint
+expedition, since it has its own database and output folder:
+
+```
+pythonw tracker.pyw --config config_hypiae_aim.toml          # tray
+python  tracker.pyw --config config_hypiae_aim.toml --cli    # headless
+python  make_shortcut.py --config config_hypiae_aim.toml --name "ED Ledger - Hypiae Aim"
+```
+
+Key settings:
+
+```toml
+commanders = ['AristonX', 'DovakiinMJ']   # several CMDRs, one journal folder
+mode       = 'sector'
+sector     = 'Hypiae Aim'
+output_dir    = "output_hypiae_aim"
+db_path       = "tracker_hypiae_aim.db"
+baseline_path = "validation_baseline_hypiae_aim.json"
+
+[survey]
+csv_path = 'data/sector-surveyor_output/hypiae_aim_unreported_systems.csv'
+```
+
+### Exploration exports
+
+Sector mode keeps one open leg for the whole survey (there are no waypoints
+or end system). Exports are **cumulative** and named by their *as-of* UTC
+date — `sector_hypiae_aim_2026-10-23.xlsx`, `sector_hypiae_aim_2026-10-23_bodies.csv`,
+and so on — plus `master_rollup.xlsx`. They refresh after the startup
+backfill, when the game writes its `Shutdown` event, on tray → **Export
+snapshot**, and when the tracker exits. Re-exporting on the same UTC day
+overwrites that day's files; each earlier day's set stays as a snapshot.
+Systems and Bodies carry a **Commander** column.
+
+### Survey CSV tracking
+
+The tracker keeps the sector-surveyor CSV up to date as you fly, adding five
+columns:
+
+| Column | Filled when | Value |
+|---|---|---|
+| `discovered` | arrival star is scanned | `new` (`WasDiscovered=false`) or `discovered` |
+| `completed` | `FSSAllBodiesFound` | commander name (`AristonX` / `DovakiinMJ`) |
+| `region` | arrival | galactic region, e.g. `Elysian Shore` |
+| `visited_utc` | first arrival | journal timestamp |
+| `completed_utc` | `FSSAllBodiesFound` | journal timestamp |
+
+- **Serendipitous systems** — an undiscovered system in the sector that
+  isn't in the CSV is appended with `direction = serendipitous`,
+  `edsm_status = not_in_edsm`, and family/subsector/mass/boxel/number parsed
+  from its name. Already-discovered systems not in the CSV are ignored, as
+  are undiscovered systems outside the sector.
+- **First value wins** — a filled cell is never overwritten, so a revisit
+  after the data was sold (now "discovered"), or the other commander
+  finishing a system second, doesn't change the record. Manual edits are
+  kept too.
+- **Region** comes from the game's `CodexEntry` when one fires in the system
+  (authoritative), otherwise from the star's coordinates via
+  [klightspeed's region map](https://github.com/klightspeed/EliteDangerousRegionMap)
+  (MIT, vendored in `engine/regionmap*.py`). Checked against 1,172 journal
+  `CodexEntry` regions, the map agrees on 98.4%; disagreements are all
+  within one ~49 ly map cell of a region boundary — and the Elysian Shore /
+  Formidine Rift boundary runs through Hypiae Aim. A later `CodexEntry`
+  corrects a map-derived region.
+- **System discovery** is read from the *arrival* star's `Scan`
+  (`DistanceFromArrivalLS == 0`), not `BodyID 0`, which is the barycentre
+  in binary systems.
+- **Name matching** treats the game's short form `Hypiae Aim NA-A d3` as
+  equal to `Hypiae Aim NA-A d0-3`.
+- **Writes are atomic** (temp file + replace) and keep the file's UTF-8 BOM
+  and line endings. The untouched original is kept once as `*.orig.csv`.
+- **Open in Excel?** Excel locks the file. Updates are held in memory, a tray
+  notification says so, and the write is retried every 30 s until the file
+  is closed. Open a *copy* if you want to browse it mid-session.
+
+**Replacing the CSV** (e.g. after re-running sector-surveyor): stop the
+tracker, drop in the new file, then replay everything already flown:
+
+```
+python tracker.pyw --config config_hypiae_aim.toml --survey-rebuild
+```
 
 ---
 
@@ -451,6 +542,11 @@ cannot be deleted while the tracker process has it open.
 
 After resetting, update `config.toml` with your new expedition route if
 needed, then launch the tracker to start fresh.
+
+To reset a different expedition config, pass it: `python tracker.pyw --config
+config_hypiae_aim.toml --reset` deletes that config's `db_path`,
+`output_dir` contents and `baseline_path` only. A survey CSV is never deleted.
+(The config window's reset button always targets `config.toml`.)
 
 ---
 
