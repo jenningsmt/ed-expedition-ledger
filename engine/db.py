@@ -16,6 +16,21 @@ from pathlib import Path
 from typing import Any
 
 
+def _waypoint_filter(column: str, waypoint_systems: "set[str] | None") -> "tuple[str, tuple]":
+    """Bare SQL condition (no AND/WHERE connector) + params for an optional
+    case-insensitive system filter. Pass the set of normalised (lowercased)
+    waypoint system names to restrict a query to just those systems -- used
+    by the waypoints_only_export config option so a survey-style expedition's
+    exports cover only its designated waypoints, not every system transited
+    between them. Returns ("", ()) when waypoint_systems is None/empty,
+    leaving the query unfiltered; callers must supply their own AND/WHERE.
+    """
+    if not waypoint_systems:
+        return "", ()
+    placeholders = ",".join("?" for _ in waypoint_systems)
+    return f"LOWER({column}) IN ({placeholders})", tuple(waypoint_systems)
+
+
 # ── Schema ─────────────────────────────────────────────────────────────────────
 
 _DDL = """
@@ -602,21 +617,31 @@ class Database:
                 ),
             )
 
-    def get_rare_finds_for_leg(self, leg_id: int) -> "list[sqlite3.Row]":
+    def get_rare_finds_for_leg(
+        self, leg_id: int, waypoint_systems: "set[str] | None" = None,
+    ) -> "list[sqlite3.Row]":
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
+        wp_and = f" AND {wp_cond}" if wp_cond else ""
         with self._lock:
             return self._exec(
-                "SELECT * FROM rare_finds WHERE leg_id=? ORDER BY system, body_id",
-                (leg_id,),
+                f"SELECT * FROM rare_finds WHERE leg_id=?{wp_and} ORDER BY system, body_id",
+                (leg_id,) + wp_params,
             ).fetchall()
 
-    def get_rare_finds_stats(self, leg_id: "int | None" = None) -> "dict[str, Any]":
+    def get_rare_finds_stats(
+        self, leg_id: "int | None" = None, waypoint_systems: "set[str] | None" = None,
+    ) -> "dict[str, Any]":
         """Return count and per-rule breakdown for rare_finds."""
         import json as _json
         where = "WHERE leg_id=?" if leg_id is not None else ""
         p: tuple = (leg_id,) if leg_id is not None else ()
+        and_ = "AND" if where else "WHERE"
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
         with self._lock:
             rows = self._exec(
-                f"SELECT matched_rules FROM rare_finds {where}", p
+                f"SELECT matched_rules FROM rare_finds {where}"
+                + (f" {and_} {wp_cond}" if wp_cond else ""),
+                p + wp_params,
             ).fetchall()
         total    = len(rows)
         breakdown: dict[str, int] = {}
@@ -677,7 +702,9 @@ class Database:
 
     # ── aggregate queries (used by exporter + validate) ────────────────────────
 
-    def stats_for_leg(self, leg_id: int | None = None) -> dict[str, Any]:
+    def stats_for_leg(
+        self, leg_id: int | None = None, waypoint_systems: "set[str] | None" = None,
+    ) -> dict[str, Any]:
         """
         Return headline metrics for one leg (or all legs if leg_id is None).
 
@@ -685,11 +712,25 @@ class Database:
         table enforces INSERT OR IGNORE on that pair, so duplicate scan events
         (revisited systems, re-scan on login) do not inflate these totals.
         Use raw_scan_stats() for the raw event-count versions.
+
+        waypoint_systems, if given, restricts systems_visited/bodies/organics/
+        codex counts to just those systems (see waypoints_only_export in
+        config.toml) -- travel stats (commander_jumps, distance_ly,
+        carrier_jumps) and sales stay whole-leg regardless, since a jump/sale
+        isn't "in" any one system and FDev's own sale events don't record
+        per-system earnings (see sales_cartographics_systems: it tracks which
+        systems contributed to a sale, but not each one's share of the total).
         """
         where = "WHERE leg_id=?" if leg_id is not None else ""
         p: tuple = (leg_id,) if leg_id is not None else ()
         # Helper: attach an AND/WHERE connector after an existing clause
         and_ = "AND" if where else "WHERE"
+
+        # Bare waypoint conditions (no connector) for the 'system' column, and
+        # separately for jumps.to_system -- callers below add their own AND.
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
+        wp_and = f" AND {wp_cond}" if wp_cond else ""
+        to_cond, to_params = _waypoint_filter("to_system", waypoint_systems)
 
         # Barycentres (from ScanBaryCentre events) are stored in the bodies table
         # for the class breakdown, but excluded from scan/discovery/mapping counts
@@ -707,34 +748,39 @@ class Database:
             # Distinct FSDJump destinations only — excludes Location-on-login
             # arrivals in carrier-jump destination systems.
             systems = self._exec(
-                f"SELECT COUNT(DISTINCT to_system) FROM jumps {where}", p
+                f"SELECT COUNT(DISTINCT to_system) FROM jumps {where}"
+                + (f" {and_} {to_cond}" if to_cond else ""),
+                p + to_params,
             ).fetchone()
             bodies = self._exec(
-                f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc}", p
+                f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc}{wp_and}", p + wp_params
             ).fetchone()
             first_disc = self._exec(
-                f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc} AND was_discovered=0", p,
+                f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc} AND was_discovered=0{wp_and}",
+                p + wp_params,
             ).fetchone()
             surface_map = self._exec(
-                f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc} AND surface_mapped=1", p,
+                f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc} AND surface_mapped=1{wp_and}",
+                p + wp_params,
             ).fetchone()
             # Terraformable: any non-empty TerraformState, regardless of planet class.
             terra = self._exec(
                 f"SELECT COUNT(*) FROM bodies {where} {and_} {no_bc} "
-                f"AND terraform_state IS NOT NULL AND terraform_state != ''", p,
+                f"AND terraform_state IS NOT NULL AND terraform_state != ''{wp_and}", p + wp_params,
             ).fetchone()
             hmc_terra = self._exec(
                 f"SELECT COUNT(*) FROM bodies {where} {and_} "
                 f"body_class='High metal content body' "
-                f"AND terraform_state IS NOT NULL AND terraform_state != ''", p,
+                f"AND terraform_state IS NOT NULL AND terraform_state != ''{wp_and}", p + wp_params,
             ).fetchone()
             organics = self._exec(
                 f"""SELECT COUNT(DISTINCT variant) FROM organic_scans
-                    {where} {and_} scan_stage=3 AND variant IS NOT NULL""",
-                p,
+                    {where} {and_} scan_stage=3 AND variant IS NOT NULL{wp_and}""",
+                p + wp_params,
             ).fetchone()
             codex_new = self._exec(
-                f"SELECT COUNT(*) FROM codex_entries {where} {and_} is_new_entry=1", p,
+                f"SELECT COUNT(*) FROM codex_entries {where} {and_} is_new_entry=1{wp_and}",
+                p + wp_params,
             ).fetchone()
             carto_sum = self._exec(
                 f"SELECT COUNT(*), COALESCE(SUM(total_earnings),0) FROM sales_cartographics {where}", p
@@ -821,25 +867,31 @@ class Database:
             "hmc_terraformable_raw":    hmc_terraformable_raw,
         }
 
-    def get_body_class_breakdown(self, leg_id: int | None = None) -> dict[str, int]:
+    def get_body_class_breakdown(
+        self, leg_id: int | None = None, waypoint_systems: "set[str] | None" = None,
+    ) -> dict[str, int]:
         """
         Count bodies per planet/star class for a leg (or all legs).
         Returns {class_name: count} sorted by count descending.
         Planet classes are full strings ('Water world', 'Icy body', …);
         star types are short spectral codes ('G', 'M', 'K', …).
         """
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
         if leg_id is not None:
+            wp_and = f" AND {wp_cond}" if wp_cond else ""
             with self._lock:
                 rows = self._exec(
                     "SELECT COALESCE(body_class,'(none)'), COUNT(*) FROM bodies "
-                    "WHERE leg_id=? GROUP BY body_class ORDER BY COUNT(*) DESC",
-                    (leg_id,),
+                    f"WHERE leg_id=?{wp_and} GROUP BY body_class ORDER BY COUNT(*) DESC",
+                    (leg_id,) + wp_params,
                 ).fetchall()
         else:
+            wp_where = f" WHERE {wp_cond}" if wp_cond else ""
             with self._lock:
                 rows = self._exec(
-                    "SELECT COALESCE(body_class,'(none)'), COUNT(*) FROM bodies "
-                    "GROUP BY body_class ORDER BY COUNT(*) DESC"
+                    "SELECT COALESCE(body_class,'(none)'), COUNT(*) FROM bodies"
+                    f"{wp_where} GROUP BY body_class ORDER BY COUNT(*) DESC",
+                    wp_params,
                 ).fetchall()
         return {r[0]: r[1] for r in rows}
 
@@ -868,34 +920,50 @@ class Database:
             row = self._exec("SELECT MIN(ts) FROM events_raw").fetchone()
         return row[0] if row else None
 
-    def get_systems_for_leg(self, leg_id: int) -> list[sqlite3.Row]:
+    def get_systems_for_leg(
+        self, leg_id: int, waypoint_systems: "set[str] | None" = None,
+    ) -> list[sqlite3.Row]:
+        wp_cond, wp_params = _waypoint_filter("system_name", waypoint_systems)
+        wp_and = f" AND {wp_cond}" if wp_cond else ""
         with self._lock:
             return self._exec(
-                "SELECT * FROM systems WHERE leg_id=? ORDER BY first_visit_ts",
-                (leg_id,),
+                f"SELECT * FROM systems WHERE leg_id=?{wp_and} ORDER BY first_visit_ts",
+                (leg_id,) + wp_params,
             ).fetchall()
 
-    def get_bodies_for_leg(self, leg_id: int) -> list[sqlite3.Row]:
+    def get_bodies_for_leg(
+        self, leg_id: int, waypoint_systems: "set[str] | None" = None,
+    ) -> list[sqlite3.Row]:
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
+        wp_and = f" AND {wp_cond}" if wp_cond else ""
         with self._lock:
             return self._exec(
-                "SELECT * FROM bodies WHERE leg_id=? ORDER BY system, body_id",
-                (leg_id,),
+                f"SELECT * FROM bodies WHERE leg_id=?{wp_and} ORDER BY system, body_id",
+                (leg_id,) + wp_params,
             ).fetchall()
 
-    def get_organics_for_leg(self, leg_id: int) -> list[sqlite3.Row]:
+    def get_organics_for_leg(
+        self, leg_id: int, waypoint_systems: "set[str] | None" = None,
+    ) -> list[sqlite3.Row]:
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
+        wp_and = f" AND {wp_cond}" if wp_cond else ""
         with self._lock:
             return self._exec(
-                """SELECT * FROM organic_scans
-                   WHERE leg_id=? AND scan_stage=3
+                f"""SELECT * FROM organic_scans
+                   WHERE leg_id=? AND scan_stage=3{wp_and}
                    ORDER BY system, body_id, genus""",
-                (leg_id,),
+                (leg_id,) + wp_params,
             ).fetchall()
 
-    def get_codex_for_leg(self, leg_id: int) -> list[sqlite3.Row]:
+    def get_codex_for_leg(
+        self, leg_id: int, waypoint_systems: "set[str] | None" = None,
+    ) -> list[sqlite3.Row]:
+        wp_cond, wp_params = _waypoint_filter("system", waypoint_systems)
+        wp_and = f" AND {wp_cond}" if wp_cond else ""
         with self._lock:
             return self._exec(
-                "SELECT * FROM codex_entries WHERE leg_id=? AND is_new_entry=1 ORDER BY ts",
-                (leg_id,),
+                f"SELECT * FROM codex_entries WHERE leg_id=? AND is_new_entry=1{wp_and} ORDER BY ts",
+                (leg_id,) + wp_params,
             ).fetchall()
 
     def get_carto_sales_for_leg(self, leg_id: int) -> list[sqlite3.Row]:

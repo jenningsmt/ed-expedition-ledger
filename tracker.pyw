@@ -145,8 +145,9 @@ def _run_cli(cfg: dict) -> None:
         log.info("Leg %d closed -- running rarity pass ...", leg_id)
         run_rarity_pass(db, cfg.get("rarity", {}))
         log.info("Leg %d -- exporting ...", leg_id)
-        export_leg(leg_id, db, cfg["output_dir"])
-        export_master_rollup(db, cfg["output_dir"])
+        wp = set(cfg["waypoint_map"].keys()) if cfg.get("waypoints_only_export", False) else None
+        export_leg(leg_id, db, cfg["output_dir"], waypoint_systems=wp)
+        export_master_rollup(db, cfg["output_dir"], waypoint_systems=wp)
 
     parser  = EventParser(db, legs, cfg, on_leg_close=on_leg_close)
     parser.restore_state()

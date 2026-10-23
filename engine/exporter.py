@@ -95,11 +95,19 @@ def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
 # ── Main entry points ──────────────────────────────────────────────────────────
 
 def export_leg(leg_id: int, db: Database, output_dir: Path,
-               suffix: str = "") -> Path:
+               suffix: str = "", waypoint_systems: "set[str] | None" = None) -> Path:
     """Export one leg to xlsx + CSVs.  Returns the xlsx path.
 
     Pass suffix (e.g. '_snapshot_20260603T014500') to distinguish an
     on-demand snapshot from the final waypoint-close export.
+
+    Pass waypoint_systems (normalised/lowercased system names, from
+    cfg["waypoint_map"] when config.toml's waypoints_only_export is true) to
+    restrict Systems/Bodies/Terraformable/Body Classes/Organics/Codex/Rare
+    Finds to just those systems, excluding everything transited in between.
+    Sales stay whole-leg regardless -- FDev's own sale events don't record
+    per-system earnings, so they can't be split the same way (see the Sales
+    sheet note below).
     """
     leg = db.get_leg(leg_id)
     if leg is None:
@@ -110,9 +118,9 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     wb     = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    stats     = db.stats_for_leg(leg_id)          # DISTINCT counts
-    class_bkd = db.get_body_class_breakdown(leg_id)
-    rf_stats  = db.get_rare_finds_stats(leg_id)
+    stats     = db.stats_for_leg(leg_id, waypoint_systems)          # DISTINCT counts
+    class_bkd = db.get_body_class_breakdown(leg_id, waypoint_systems)
+    rf_stats  = db.get_rare_finds_stats(leg_id, waypoint_systems)
 
     # ── Summary sheet ──────────────────────────────────────────────────────────
     ws = wb.create_sheet("Summary")
@@ -123,6 +131,17 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         ("Start time (UTC)",     leg["start_ts"] or "—"),
         ("End system",           leg["end_system"] or "—"),
         ("End time (UTC)",       leg["end_ts"] or "—"),
+    ]
+    if waypoint_systems:
+        summary_rows.append((
+            "Note",
+            f"waypoints_only_export is ON — Systems/Bodies/Terraformable/Body Classes/"
+            f"Organics/Codex/Rare Finds below cover only this leg's {len(waypoint_systems)} "
+            f"configured waypoint system(s), not systems transited in between. Sales "
+            f"totals are NOT filterable this way (FDev's sale events don't record "
+            f"per-system earnings) and cover the whole leg.",
+        ))
+    summary_rows += [
         ("", ""),
         ("— Journey ——————————", ""),
         ("Commander jumps",      stats["commander_jumps"]),
@@ -171,7 +190,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         "Star Pos X", "Star Pos Y", "Star Pos Z",
     ]
     sys_rows = []
-    for s in db.get_systems_for_leg(leg_id):
+    for s in db.get_systems_for_leg(leg_id, waypoint_systems):
         sys_rows.append([
             s["system_name"], s["first_visit_ts"], s["body_count"],
             "Yes" if s["fully_scanned"] else "No",
@@ -186,7 +205,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         "Landable", "Dist LS", "First Discovery", "Pre-Mapped", "Surface Mapped",
     ]
     body_rows = []
-    for b in db.get_bodies_for_leg(leg_id):
+    for b in db.get_bodies_for_leg(leg_id, waypoint_systems):
         body_rows.append([
             b["system"], b["body_name"], b["body_id"], b["body_class"],
             b["terraform_state"],
@@ -207,7 +226,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         "First Discovery", "Surface Mapped", "Landable",
     ]
     terra_rows = []
-    for b in db.get_bodies_for_leg(leg_id):
+    for b in db.get_bodies_for_leg(leg_id, waypoint_systems):
         is_terra = bool(b["terraform_state"] and b["terraform_state"].strip())
         is_high_value = b["body_class"] in _HIGH_VALUE_CLASSES
         if is_terra or is_high_value:
@@ -234,7 +253,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     # ── Organics sheet ─────────────────────────────────────────────────────────
     org_headers = ["System", "Body ID", "Genus", "Species", "Variant"]
     org_rows = []
-    for o in db.get_organics_for_leg(leg_id):
+    for o in db.get_organics_for_leg(leg_id, waypoint_systems):
         org_rows.append([o["system"], o["body_id"], o["genus"], o["species"], o["variant"]])
     _add_sheet(wb, "Organics", org_headers, org_rows)
     _write_csv(output_dir / f"{slug}_organics.csv", org_headers, org_rows)
@@ -242,7 +261,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     # ── Codex sheet ────────────────────────────────────────────────────────────
     codex_headers = ["Timestamp", "Name", "Region", "System"]
     codex_rows = [[c["ts"], c["name"], c["region"], c["system"]]
-                  for c in db.get_codex_for_leg(leg_id)]
+                  for c in db.get_codex_for_leg(leg_id, waypoint_systems)]
     _add_sheet(wb, "Codex Firsts", codex_headers, codex_rows)
     _write_csv(output_dir / f"{slug}_codex.csv", codex_headers, codex_rows)
 
@@ -252,7 +271,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         "Dist LS", "First Discovery", "Pre-Mapped", "Footfalled",
     ]
     rf_rows = []
-    for rf in db.get_rare_finds_for_leg(leg_id):
+    for rf in db.get_rare_finds_for_leg(leg_id, waypoint_systems):
         try:
             rules = ", ".join(json.loads(rf["matched_rules"]))
             dets  = "; ".join(
@@ -290,8 +309,14 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     return xlsx_p
 
 
-def export_master_rollup(db: Database, output_dir: Path) -> Path:
-    """Build/overwrite the master rollup workbook."""
+def export_master_rollup(
+    db: Database, output_dir: Path, waypoint_systems: "set[str] | None" = None,
+) -> Path:
+    """Build/overwrite the master rollup workbook.
+
+    See export_leg() for what waypoint_systems restricts (and what it
+    doesn't -- sales stay whole-leg/whole-expedition regardless).
+    """
     xlsx_p = output_dir / "master_rollup.xlsx"
     wb     = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -309,13 +334,13 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
     ws.append(headers)
     _style_header(ws)
 
-    grand     = db.stats_for_leg(None)
-    grand_bkd = db.get_body_class_breakdown(None)
-    grand_rf  = db.get_rare_finds_stats(None)
+    grand     = db.stats_for_leg(None, waypoint_systems)
+    grand_bkd = db.get_body_class_breakdown(None, waypoint_systems)
+    grand_rf  = db.get_rare_finds_stats(None, waypoint_systems)
 
     for leg in all_legs:
-        s  = db.stats_for_leg(leg["leg_id"])
-        rf = db.get_rare_finds_stats(leg["leg_id"])
+        s  = db.stats_for_leg(leg["leg_id"], waypoint_systems)
+        rf = db.get_rare_finds_stats(leg["leg_id"], waypoint_systems)
         ws.append([
             leg["ordinal"],
             leg["name"] or "—",
@@ -352,7 +377,16 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
 
     # ── Whole-expedition summary ───────────────────────────────────────────────
     ws2 = wb.create_sheet("Expedition Summary")
-    summ = [
+    summ: list[tuple] = []
+    if waypoint_systems:
+        summ.append((
+            "Note",
+            f"waypoints_only_export is ON — per-system figures below cover only the "
+            f"{len(waypoint_systems)} configured waypoint system(s); Carto/Exo-Bio "
+            f"sales are whole-expedition (not filterable per system).",
+        ))
+        summ.append(("", ""))
+    summ += [
         ("Commander jumps",     grand["commander_jumps"]),
         ("Total distance (LY)", f"{grand['distance_ly']:.2f}"),
         ("Carrier jumps",       grand["carrier_jumps"]),
@@ -410,7 +444,7 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
     ]
     all_rf_rows = []
     for leg in all_legs:
-        for rf in db.get_rare_finds_for_leg(leg["leg_id"]):
+        for rf in db.get_rare_finds_for_leg(leg["leg_id"], waypoint_systems):
             try:
                 rules = ", ".join(json.loads(rf["matched_rules"]))
                 dets  = "; ".join(
