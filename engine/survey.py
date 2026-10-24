@@ -488,6 +488,25 @@ class SurveyTracker:
                 for r in self._rows if r.get("survey_region") in wanted
             ]
 
+    def system_role(self, system_name: str) -> dict:
+        """How a visited system relates to the survey, for the Systems export:
+        role is "target" (a candidate in a claimed region — or any candidate
+        in a plain list), "other-region candidate", "serendipitous" (an
+        undiscovered in-sector system appended to the list) or "transit"."""
+        with self._lock:
+            row = self._index.get(system_key(system_name))
+            if row is None:
+                return {"role": "transit", "survey_region": "", "visit_order": ""}
+            region = row.get("survey_region", "")
+            if row.get("direction") == "serendipitous":
+                role = "serendipitous"
+            elif region and region not in self._claimed:
+                role = "other-region candidate"
+            else:
+                role = "target"
+            return {"role": role, "survey_region": region,
+                    "visit_order": row.get("visit_order", "")}
+
     def next_target(self) -> "dict | None":
         """Lowest-visit_order unresolved row in the active region, else in the
         other claimed regions.  Route order, not distance."""

@@ -389,7 +389,7 @@ def test_region_leg_export_has_candidates_sheet(db, sector_cfg):
     rig.jump(OUTSIDE)
     closed = db.get_leg(rig.closed[0])
     xlsx = export_for_config(sector_cfg, db, closed["leg_id"], survey=rig.survey)
-    assert xlsx.name == f"sector_hypiae_aim_r01_{closed['end_ts'][:10]}.xlsx"
+    assert xlsx.name == f"hypiae_aim_R01_{closed['end_ts'][:10]}.xlsx"
     wb = openpyxl.load_workbook(xlsx)
     assert "Candidates" in wb.sheetnames
     cand = (sector_cfg["output_dir"] / f"{xlsx.stem}_candidates.csv").read_text().splitlines()
@@ -428,7 +428,7 @@ def test_migration_close_leg_then_rebuild(sector_cfg, tmp_path, capsys):
     assert db.get_active_leg()["ordinal"] == 2
     db.close()
     date = first["end_ts"][:10]
-    assert (sector_cfg["output_dir"] / f"sector_hypiae_aim_hypiae_aim_pre_regions_{date}.xlsx").exists()
+    assert (sector_cfg["output_dir"] / f"hypiae_aim_pre-regions_{date}.xlsx").exists()
 
     # Point the config at the clustered file and replay progress into it.
     tracker._run_survey_rebuild(sector_cfg)
@@ -457,3 +457,53 @@ def test_survey_resolve_command(sector_cfg, capsys):
 
     with pytest.raises(SystemExit):
         tracker._run_survey_resolve(sector_cfg, ["Hypiae Aim QQ-Q c9-9"], "not_found")
+
+
+# ── Region-close exports: file suite + systems roles ───────────────────────────
+
+SUITE = ["bodies", "body_classes", "codex", "organics", "rare_finds", "sales",
+         "systems", "terraformable", "candidates", "master_rollup"]
+
+
+def test_region_close_writes_full_suite_with_roles_and_discovery(db, sector_cfg):
+    """Fly R02 via a discovered transit system, an undiscovered transit system
+    outside the sector, a serendipitous in-sector system and an R01 candidate
+    (R01 unclaimed) — then check the R02 export distinguishes all of them."""
+    rig = make_rig(db, sector_cfg, regions=["R02"])
+    rig.explore("Old Transit Star", discovered=True)       # transit, previously discovered
+    rig.explore("Far Away AB-C d1-1", discovered=False)    # transit, new (not in sector)
+    rig.explore(OUTSIDE, discovered=False)                 # serendipitous
+    rig.explore(A1, discovered=True)                       # other-region candidate
+    rig.explore(B1, discovered=False)                      # target, new
+    rig.explore(B2, discovered=True)                       # target, previously discovered
+    rig.jump("Departure Star")                             # R02 closes → expedition complete
+
+    closed = db.get_leg(rig.closed[0])
+    assert closed["name"] == "R02"
+    date = closed["end_ts"][:10]
+    out = sector_cfg["output_dir"]
+    xlsx = export_for_config(sector_cfg, db, closed["leg_id"], survey=rig.survey)
+    stem = f"hypiae_aim_R02_{date}"
+    assert xlsx.name == f"{stem}.xlsx"
+    for part in SUITE:
+        ext = "xlsx" if part == "master_rollup" else "csv"
+        assert (out / f"{stem}_{part}.{ext}").exists(), part
+    assert (out / "master_rollup.xlsx").exists()
+
+    with open(out / f"{stem}_systems.csv", encoding="utf-8") as fh:
+        rows = {r["System"]: r for r in csv.DictReader(fh)}
+    got = {name: (r["Survey Role"], r["Discovery"], r["Survey Region"], r["Visit Order"])
+           for name, r in rows.items()}
+    assert got == {
+        "Old Transit Star":   ("transit", "previously discovered", "", ""),
+        "Far Away AB-C d1-1": ("transit", "new", "", ""),
+        OUTSIDE:              ("serendipitous", "new", "", ""),
+        A1:                   ("other-region candidate", "previously discovered", "R01", "1"),
+        B1:                   ("target", "new", "R02", "3"),
+        B2:                   ("target", "previously discovered", "R02", "4"),
+    }
+    summary = {r[0].value: r[1].value for r in openpyxl.load_workbook(xlsx)["Summary"].iter_rows()}
+    assert summary["Targets visited"] == 2
+    assert summary["Serendipitous (new, in sector)"] == 1
+    assert summary["Transit systems"] == 2
+    assert summary["Other-region candidates visited"] == 1

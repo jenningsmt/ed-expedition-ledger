@@ -332,6 +332,10 @@ def test_shutdown_callback_only_when_live(db, sector_cfg):
 
 def test_sector_slug():
     assert sector_slug("Hypiae Aim", "2026-10-23") == "sector_hypiae_aim_2026-10-23"
+    assert sector_slug("Hypiae Aim", "2026-10-25", "R14") == "hypiae_aim_R14_2026-10-25"
+    assert sector_slug("Hypiae Aim", "2026-10-25", "R01 + R02") == "hypiae_aim_R01_R02_2026-10-25"
+    assert (sector_slug("Hypiae Aim", "2026-10-24", "Hypiae Aim (pre-regions)")
+            == "hypiae_aim_pre-regions_2026-10-24")
 
 
 def test_export_for_config_uses_sector_names(db, sector_cfg):
@@ -345,4 +349,4 @@ def test_export_for_config_uses_sector_names(db, sector_cfg):
     assert (out / f"sector_hypiae_aim_{today}_bodies.csv").exists()
     assert (out / "master_rollup.xlsx").exists()
     header = (out / f"sector_hypiae_aim_{today}_systems.csv").read_text().splitlines()[0]
-    assert header.endswith(",Commander")
+    assert header.endswith(",Commander,Discovery")      # no survey passed: no role columns

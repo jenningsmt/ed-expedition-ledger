@@ -961,11 +961,20 @@ class Database:
     def get_systems_for_leg(
         self, leg_id: int, waypoint_systems: "set[str] | None" = None,
     ) -> list[sqlite3.Row]:
-        wp_cond, wp_params = _waypoint_filter("system_name", waypoint_systems)
+        """Systems first visited in the leg.  arrival_was_discovered is the
+        arrival star's WasDiscovered from our first scan of it (1/0), or None
+        if it was never scanned (e.g. arrived by carrier)."""
+        wp_cond, wp_params = _waypoint_filter("s.system_name", waypoint_systems)
         wp_and = f" AND {wp_cond}" if wp_cond else ""
         with self._lock:
             return self._exec(
-                f"SELECT * FROM systems WHERE leg_id=?{wp_and} ORDER BY first_visit_ts",
+                f"""SELECT s.*,
+                       (SELECT b.was_discovered FROM bodies b
+                        WHERE b.system = s.system_name
+                          AND b.distance_from_arrival_ls = 0
+                          AND b.body_class != 'Barycentre'
+                        ORDER BY b.ts LIMIT 1) AS arrival_was_discovered
+                    FROM systems s WHERE s.leg_id=?{wp_and} ORDER BY s.first_visit_ts""",
                 (leg_id,) + wp_params,
             ).fetchall()
 

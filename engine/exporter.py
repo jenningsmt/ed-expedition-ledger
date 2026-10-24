@@ -25,9 +25,10 @@ import csv
 import json
 import logging
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -89,13 +90,19 @@ def _leg_slug(leg) -> str:
 def sector_slug(sector: str, as_of: str, leg_name: "str | None" = None) -> str:
     """File stem for a sector-survey export.
 
-    Open (cumulative) leg:  sector_hypiae_aim_2026-10-23
-    Closed leg:             sector_hypiae_aim_r01_2026-10-25
+    Open leg (as-of):  sector_hypiae_aim_2026-10-23
+    Closed leg:        hypiae_aim_R14_2026-10-25          (region "R14")
+                       hypiae_aim_R01_R02_2026-10-25      ("R01 + R02")
+                       hypiae_aim_pre-regions_2026-10-24  ("Hypiae Aim (pre-regions)")
     """
-    stem = f"sector_{sector.lower().strip().replace(' ', '_')}"
-    if leg_name:
-        stem += "_" + re.sub(r"[^a-z0-9]+", "_", leg_name.lower()).strip("_")
-    return f"{stem}_{as_of}"
+    sector_part = sector.lower().strip().replace(" ", "_")
+    if not leg_name:
+        return f"sector_{sector_part}_{as_of}"
+    name = leg_name.strip()
+    if name.lower().startswith(sector.lower().strip()):
+        name = name[len(sector.strip()):]          # don't repeat the sector
+    name = re.sub(r"[^A-Za-z0-9-]+", "_", name).strip("_") or "leg"
+    return f"{sector_part}_{name}_{as_of}"
 
 
 def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
@@ -116,6 +123,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
                suffix: str = "", waypoint_systems: "set[str] | None" = None,
                slug: "str | None" = None, as_of: "str | None" = None,
                extra_sheets: "list[tuple[str, str, list[str], list[list]]] | None" = None,
+               system_role: "Callable[[str], dict] | None" = None,
                ) -> Path:
     """Export one leg to xlsx + CSVs.  Returns the xlsx path.
 
@@ -125,7 +133,9 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     Pass slug to override the file stem entirely (sector mode), and as_of
     to add an "As of (UTC)" row to the Summary sheet.  extra_sheets is a list
     of (sheet name, csv suffix, headers, rows) appended after the standard
-    sheets, each also written as <slug>_<csv suffix>.csv.
+    sheets, each also written as <slug>_<csv suffix>.csv.  system_role
+    (SurveyTracker.system_role) adds Survey Role / Region / Visit Order
+    columns to Systems and survey counts to the Summary.
 
     Pass waypoint_systems (normalised/lowercased system names, from
     cfg["waypoint_map"] when config.toml's waypoints_only_export is true) to
@@ -147,6 +157,31 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     stats     = db.stats_for_leg(leg_id, waypoint_systems)          # DISTINCT counts
     class_bkd = db.get_body_class_breakdown(leg_id, waypoint_systems)
     rf_stats  = db.get_rare_finds_stats(leg_id, waypoint_systems)
+
+    # Systems first: the Summary counts survey roles from them.
+    sys_headers = [
+        "System", "First Visit (UTC)", "Body Count", "Fully Scanned",
+        "Star Pos X", "Star Pos Y", "Star Pos Z", "Commander", "Discovery",
+    ]
+    if system_role:
+        sys_headers += ["Survey Role", "Survey Region", "Visit Order"]
+    sys_rows = []
+    role_counts: dict[tuple[str, str], int] = {}
+    for s in db.get_systems_for_leg(leg_id, waypoint_systems):
+        disc = s["arrival_was_discovered"]
+        discovery = "" if disc is None else ("previously discovered" if disc else "new")
+        row = [
+            s["system_name"], s["first_visit_ts"], s["body_count"],
+            "Yes" if s["fully_scanned"] else "No",
+            s["star_pos_x"], s["star_pos_y"], s["star_pos_z"], s["commander"] or "",
+            discovery,
+        ]
+        if system_role:
+            info = system_role(s["system_name"])
+            row += [info["role"], info["survey_region"], info["visit_order"]]
+            key = (info["role"], discovery)
+            role_counts[key] = role_counts.get(key, 0) + 1
+        sys_rows.append(row)
 
     # ── Summary sheet ──────────────────────────────────────────────────────────
     ws = wb.create_sheet("Summary")
@@ -202,6 +237,22 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         ("— Rare / notable finds ————————", ""),
         ("Rare finds (first discoveries)", rf_stats["rare_finds_count"]),
     ]
+    if system_role:
+        def count(role: str, discovery: "str | None" = None) -> int:
+            return sum(n for (r, d), n in role_counts.items()
+                       if r == role and (discovery is None or d == discovery))
+        summary_rows += [
+            ("", ""),
+            ("— Survey (systems first visited this leg) ——", ""),
+            ("Targets visited",                 count("target")),
+            ("  new discoveries",               count("target", "new")),
+            ("  previously discovered",         count("target", "previously discovered")),
+            ("Other-region candidates visited", count("other-region candidate")),
+            ("Serendipitous (new, in sector)",  count("serendipitous")),
+            ("Transit systems",                 count("transit")),
+            ("  new discoveries",               count("transit", "new")),
+            ("  previously discovered",         count("transit", "previously discovered")),
+        ]
     rf_bkd = rf_stats["rare_finds_by_rule"]
     for rule_tag, cnt in sorted(rf_bkd.items()):
         summary_rows.append((f"  {rule_tag}", cnt))
@@ -213,17 +264,6 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     ws.column_dimensions["B"].width = 22
 
     # ── Systems sheet ──────────────────────────────────────────────────────────
-    sys_headers = [
-        "System", "First Visit (UTC)", "Body Count", "Fully Scanned",
-        "Star Pos X", "Star Pos Y", "Star Pos Z", "Commander",
-    ]
-    sys_rows = []
-    for s in db.get_systems_for_leg(leg_id, waypoint_systems):
-        sys_rows.append([
-            s["system_name"], s["first_visit_ts"], s["body_count"],
-            "Yes" if s["fully_scanned"] else "No",
-            s["star_pos_x"], s["star_pos_y"], s["star_pos_z"], s["commander"] or "",
-        ])
     _add_sheet(wb, "Systems", sys_headers, sys_rows)
     _write_csv(output_dir / f"{slug}_systems.csv", sys_headers, sys_rows)
 
@@ -514,7 +554,9 @@ def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "",
     Waypoint mode: Leg##_<name>_<start date><suffix>.
     Sector mode:   open leg → sector_<sector>_<as-of date>, so re-exporting on
                    the same UTC day overwrites that day's files;
-                   closed leg → sector_<sector>_<leg name>_<close date>.
+                   closed leg → <sector>_<leg name>_<close date> (e.g.
+                   hypiae_aim_R14_2026-10-25), plus a copy of the master
+                   rollup as of that close, <stem>_master_rollup.xlsx.
     A closed survey-region leg ("R01", "R01 + R02") also gets a Candidates
     sheet listing that region's rows from the survey CSV.
     """
@@ -538,8 +580,12 @@ def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "",
             as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             slug  = sector_slug(cfg["sector"], as_of)
         xlsx_p = export_leg(leg_id, db, out, waypoint_systems=wp,
-                            slug=slug, as_of=as_of, extra_sheets=extra)
+                            slug=slug, as_of=as_of, extra_sheets=extra,
+                            system_role=survey.system_role if survey else None)
     else:
         xlsx_p = export_leg(leg_id, db, out, suffix=suffix, waypoint_systems=wp)
-    export_master_rollup(db, out, waypoint_systems=wp)
+    rollup = export_master_rollup(db, out, waypoint_systems=wp)
+    if cfg.get("mode") == "sector" and leg["end_ts"]:
+        # The live master_rollup.xlsx keeps changing; keep it as of this close.
+        shutil.copy2(rollup, out / f"{slug}_master_rollup.xlsx")
     return xlsx_p

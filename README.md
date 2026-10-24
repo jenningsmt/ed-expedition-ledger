@@ -294,10 +294,42 @@ overwrites that day's files; each earlier day's set stays as a snapshot.
 With a plain list the open leg spans the whole survey, so these exports are
 cumulative.
 
-A **closed** leg is exported under its own name and close date, e.g.
-`sector_hypiae_aim_r01_2026-11-02.xlsx` or
-`sector_hypiae_aim_hypiae_aim_pre_regions_2026-10-24.xlsx`.
-Systems and Bodies carry a **Commander** column.
+A **closed** leg is exported under its own name and close date, without the
+`sector_` prefix — a survey region closing on 2 Nov writes:
+
+```
+hypiae_aim_R14_2026-11-02.xlsx
+hypiae_aim_R14_2026-11-02_bodies.csv          hypiae_aim_R14_2026-11-02_rare_finds.csv
+hypiae_aim_R14_2026-11-02_body_classes.csv    hypiae_aim_R14_2026-11-02_sales.csv
+hypiae_aim_R14_2026-11-02_codex.csv           hypiae_aim_R14_2026-11-02_systems.csv
+hypiae_aim_R14_2026-11-02_organics.csv        hypiae_aim_R14_2026-11-02_terraformable.csv
+hypiae_aim_R14_2026-11-02_candidates.csv      (survey-region legs only)
+hypiae_aim_R14_2026-11-02_master_rollup.xlsx  (the master rollup as of this close)
+```
+
+Regions closing together give `hypiae_aim_R01_R02_<date>_*`; a leg closed by
+hand as "Hypiae Aim (pre-regions)" gives `hypiae_aim_pre-regions_<date>_*`.
+`master_rollup.xlsx` itself is rewritten on every export.
+
+Systems and Bodies carry a **Commander** column. Systems also says how each
+system relates to the survey, so targets and the systems flown through to
+reach them can be told apart:
+
+| Column | Values |
+|---|---|
+| `Discovery` | `new` (undiscovered on arrival) or `previously discovered`, from the arrival star's scan; blank if it was never scanned (e.g. arrived by carrier) |
+| `Survey Role` | `target` — a candidate in a claimed region; `other-region candidate` — on the list but in a region you didn't claim; `serendipitous` — undiscovered, in the sector, not on the list (also appended to the CSV); `transit` — anything else |
+| `Survey Region`, `Visit Order` | from the candidate file, for listed systems |
+
+The Summary sheet counts them: targets visited (new / previously
+discovered), other-region candidates, serendipitous systems and transit
+systems (new / previously discovered). `Discovery` appears in waypoint
+exports too; the survey columns only with a candidate file.
+
+Only systems in the loaded file can be told apart: with a file holding just
+your regions, an undiscovered candidate from another region shows as
+`serendipitous` (or `transit` if already discovered). Load the full file with
+`regions = [...]` to have those labelled `other-region candidate`.
 
 ### Survey CSV tracking
 
@@ -435,7 +467,7 @@ Then point the config at the clustered file and replay your progress into it:
 
 1. Stop the tracker (tray → **Stop & exit**).
 2. Close the open leg; this exports it as
-   `sector_hypiae_aim_hypiae_aim_pre_regions_<date>.*` and opens the next leg.
+   `hypiae_aim_pre-regions_<date>_*` and opens the next leg.
    In the app: tray → **Configure expedition…** → **Close current leg…**
    (it suggests "Hypiae Aim (pre-regions)"; this one works with the tracker
    running). From source:
