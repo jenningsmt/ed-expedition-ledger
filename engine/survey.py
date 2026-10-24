@@ -1,7 +1,7 @@
 """
 Sector survey tracker.
 
-Keeps a sector-surveyor candidate CSV (one row per system believed to exist
+Keeps a Sector Surveyor candidate CSV (one row per system believed to exist
 but unreported to EDSM) up to date as the commander flies the sector:
 
   discovered     "new" if the arrival star's Scan says WasDiscovered=false,
@@ -11,19 +11,35 @@ but unreported to EDSM) up to date as the commander flies the sector:
                  reports one, else derived from StarPos via engine.regionmap)
   visited_utc    first arrival timestamp
   completed_utc  FSSAllBodiesFound timestamp
+  resolution     clustered files only — set by the commander ("not_found",
+                 "done_by_other", ...); any non-empty value resolves the row
 
 Undiscovered in-sector systems missing from the CSV are appended with
 direction="serendipitous".  Discovered systems missing from the CSV are ignored.
 
+Two input formats, detected from the header
+-------------------------------------------
+* Plain candidate list — system_name, edsm_status, direction, ...
+* Clustered candidates (Sector Surveyor 1.6.0+) — adds visit_order and
+  survey_region (R01…Rnn).  Each claimed survey region is a unit of work:
+  once every row in it is resolved, the parser closes the active leg named
+  after it on the next FSDJump away (see LegManager.on_regions_complete).
+  Pre-1.6.0 builds named survey_region "region", colliding with the
+  tracker's galactic-region column; those files are refused.
+
 Write rules
 -----------
-* First value wins: a non-empty cell is never overwritten, so replaying
-  journals is idempotent and manual edits survive.  The one exception is
+* First value wins for the tracker's own columns: a non-empty cell is never
+  overwritten, so replaying journals is idempotent.  The one exception is
   region — the game's CodexEntry region replaces a map-derived one, because
   the map is ~49 ly per cell and misreads systems near region boundaries.
-* The CSV is the persistent state.  It is rewritten atomically (temp file +
-  os.replace) and keeps its BOM / line endings.  If the file is locked (open
-  in Excel), changes stay in memory and the write is retried on a timer.
+* Edits made to the file while the tracker runs are merged in before each
+  write (and before region checks) whenever the file's mtime changes:
+  resolution and the source columns take the disk value, the tracker's own
+  columns keep the in-memory value when it has one.
+* The CSV is rewritten atomically (temp file + os.replace) and keeps its
+  BOM / line endings.  If the file is locked (open in Excel), changes stay in
+  memory and the write is retried on a timer.
 """
 from __future__ import annotations
 
@@ -42,6 +58,8 @@ from .regionmap import find_region
 log = logging.getLogger(__name__)
 
 SURVEY_COLUMNS = ["discovered", "completed", "region", "visited_utc", "completed_utc"]
+RESOLUTION = "resolution"
+COMPLETE_WHEN = ("completed", "visited")
 
 # Procedural name: "<Sector> AB-C d12-34".  The "12-" part is omitted by the
 # game when it is 0 ("NA-A d3" == "NA-A d0-3").
@@ -49,6 +67,11 @@ _NAME_RE = re.compile(
     r"^(?P<sector>.+?) (?P<sub>[A-Z]{2}-[A-Z]) (?P<mc>[a-h])(?:(?P<n1>\d+)-)?(?P<n2>\d+)$",
     re.IGNORECASE,
 )
+_SURVEY_REGION_RE = re.compile(r"^R\d+$")
+
+
+class SurveyFormatError(ValueError):
+    """The candidate CSV can't be used as-is (e.g. a pre-1.6.0 clustered file)."""
 
 
 def parse_system_name(name: str) -> "dict | None":
@@ -74,6 +97,33 @@ def system_key(name: str) -> str:
             f"{p['mass_code']}{p['boxel']}-{p['number']}")
 
 
+def detect_format(fields: "list[str]", rows: "list[dict]") -> str:
+    """Return "clustered" or "plain"; raise SurveyFormatError for pre-1.6.0
+    clustered files whose survey-region column is named "region"."""
+    if "survey_region" in fields and "visit_order" in fields:
+        return "clustered"
+    if ("cluster" in fields or "visit_order" in fields) and "region" in fields:
+        if any(_SURVEY_REGION_RE.match(r.get("region") or "") for r in rows):
+            raise SurveyFormatError(
+                "This clustered candidates file was made by a Sector Surveyor build "
+                "before 1.6.0: its survey-region column is named 'region', which "
+                "collides with the tracker's galactic-region column. Regenerate it "
+                "with Sector Surveyor 1.6.0 or later (column 'survey_region')."
+            )
+    return "plain"
+
+
+def _read_csv(path: Path) -> "tuple[list[str], list[dict], bool, str]":
+    """(fieldnames, rows, has_bom, newline) for a CSV file."""
+    raw = path.read_bytes()
+    text = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    fields = list(reader.fieldnames or [])
+    rows = [{f: (row.get(f) or "") for f in fields} for row in reader]
+    newline = "\r\n" if "\r\n" in text[:4096] else "\n"
+    return fields, rows, raw.startswith(b"\xef\xbb\xbf"), newline
+
+
 class SurveyTracker:
     def __init__(
         self,
@@ -81,11 +131,16 @@ class SurveyTracker:
         sector: str,
         on_write_blocked: "Callable[[str], None] | None" = None,
         retry_seconds: float = 30.0,
+        regions: "list[str] | None" = None,
+        complete_when: str = "completed",
     ) -> None:
         self.path = Path(csv_path)
         self._sector_prefix = sector.lower().strip() + " "
         self._on_write_blocked = on_write_blocked
         self._retry_seconds = retry_seconds
+        if complete_when not in COMPLETE_WHEN:
+            raise ValueError(f"region_complete_when must be one of {COMPLETE_WHEN}")
+        self._explored_col = "completed" if complete_when == "completed" else "visited_utc"
 
         # Set False during backfill/rebuild to batch writes; call flush() after.
         self.autoflush = True
@@ -99,32 +154,91 @@ class SurveyTracker:
         self._arrivals: dict[str, tuple[str, list]] = {}
         # key → region reported by the game in a CodexEntry.
         self._codex_regions: dict[str, str] = {}
+        # Survey region of the most recently visited candidate (next target).
+        self._active_region: str | None = None
 
         self._load()
+        self._claimed = self._resolve_claims(regions)
 
     # ── CSV I/O ────────────────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        raw = self.path.read_bytes()
-        self._bom = raw.startswith(b"\xef\xbb\xbf")
-        text = raw.decode("utf-8-sig")
-        self._newline = "\r\n" if "\r\n" in text[:4096] else "\n"
-
-        reader = csv.DictReader(io.StringIO(text, newline=""))
-        self._fields: list[str] = list(reader.fieldnames or [])
-        for col in SURVEY_COLUMNS:
+        fields, rows, self._bom, self._newline = _read_csv(self.path)
+        self.format = detect_format(fields, rows)
+        self._fields = fields
+        own = SURVEY_COLUMNS + ([RESOLUTION] if self.clustered else [])
+        for col in own:
             if col not in self._fields:
                 self._fields.append(col)
-        self._rows: list[dict] = [
-            {f: (row.get(f) or "") for f in self._fields} for row in reader
-        ]
+        self._rows: list[dict] = [{f: r.get(f, "") for f in self._fields} for r in rows]
         self._index = {system_key(r["system_name"]): r for r in self._rows}
-        log.info("Survey: loaded %d candidate systems from %s", len(self._rows), self.path.name)
+        self._mtime_ns = self.path.stat().st_mtime_ns
+        if self.clustered:
+            visited = [r for r in self._rows if r["survey_region"] and r["visited_utc"]]
+            if visited:
+                self._active_region = max(visited, key=lambda r: r["visited_utc"])["survey_region"]
+        log.info("Survey: loaded %d candidate systems (%s format) from %s",
+                 len(self._rows), self.format, self.path.name)
+
+    @property
+    def clustered(self) -> bool:
+        return self.format == "clustered"
+
+    def _refresh(self) -> bool:
+        """Merge edits made to the file since we last read or wrote it.
+        Returns False if the file couldn't be read."""
+        try:
+            mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            return True  # file gone: our next write recreates it
+        if mtime == self._mtime_ns:
+            return True
+        try:
+            fields, rows, _, _ = _read_csv(self.path)
+            detect_format(fields, rows)
+        except (OSError, UnicodeDecodeError, csv.Error, SurveyFormatError) as exc:
+            log.warning("Survey: could not read edits from %s (%s).", self.path.name, exc)
+            return False
+        self._merge(fields, rows)
+        self._mtime_ns = mtime
+        return True
+
+    def _merge(self, fields: "list[str]", rows: "list[dict]") -> None:
+        own = set(SURVEY_COLUMNS)
+        for f in fields:
+            if f not in self._fields:
+                self._fields.append(f)
+                for r in self._rows:
+                    r[f] = ""
+        changed = False
+        for disk in rows:
+            key = system_key(disk.get("system_name", ""))
+            mem = self._index.get(key)
+            if mem is None:
+                # Row added by hand: keep it.
+                mem = {f: "" for f in self._fields}
+                self._rows.append(mem)
+                self._index[key] = mem
+            for f in fields:
+                value = disk.get(f, "")
+                if f in own:
+                    if not mem[f] and value:       # tracker's column: memory wins
+                        mem[f] = value
+                    elif mem[f] != value:
+                        changed = True             # our value isn't on disk yet
+                elif mem[f] != value:              # resolution & source columns: disk wins
+                    mem[f] = value
+        # Rows only in memory (appended, not yet written) are kept.
+        if changed or len(rows) != len(self._rows):
+            self._dirty = True
+        log.info("Survey: merged external edits from %s", self.path.name)
 
     def flush(self) -> bool:
         """Write pending changes.  Returns False if the file is locked (a retry
         is scheduled and on_write_blocked is called once per lock episode)."""
         with self._lock:
+            if not self._refresh():
+                return self._blocked("can't be read")
             if not self._dirty:
                 return True
             buf = io.StringIO()
@@ -140,21 +254,13 @@ class SurveyTracker:
                     shutil.copy2(self.path, backup)
                 tmp.write_bytes(data)
                 os.replace(tmp, self.path)
+                self._mtime_ns = self.path.stat().st_mtime_ns
             except OSError as exc:
-                log.warning("Survey: could not write %s (%s) — will retry in %.0fs.",
-                            self.path.name, exc, self._retry_seconds)
                 try:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
-                self._schedule_retry()
-                if self._on_write_blocked and not self._blocked_notified:
-                    self._blocked_notified = True
-                    self._on_write_blocked(
-                        f"{self.path.name} is locked (open in Excel?). "
-                        f"Survey updates are held and will be written when it's closed."
-                    )
-                return False
+                return self._blocked(f"is locked ({exc})")
 
             self._dirty = False
             self._blocked_notified = False
@@ -163,6 +269,17 @@ class SurveyTracker:
                 self._timer = None
             log.debug("Survey: wrote %s", self.path.name)
             return True
+
+    def _blocked(self, why: str) -> bool:
+        log.warning("Survey: %s %s — will retry in %.0fs.", self.path.name, why, self._retry_seconds)
+        self._schedule_retry()
+        if self._on_write_blocked and not self._blocked_notified:
+            self._blocked_notified = True
+            self._on_write_blocked(
+                f"{self.path.name} is locked (open in Excel?). "
+                f"Survey updates are held and will be written when it's closed."
+            )
+        return False
 
     def _schedule_retry(self) -> None:
         if self._timer and self._timer.is_alive():
@@ -200,6 +317,22 @@ class SurveyTracker:
                 if self.autoflush:
                     self.flush()
 
+    def resolve(self, system_name: str, value: str) -> bool:
+        """Set a row's resolution (e.g. "not_found"; "" clears it).
+        Returns False if the system isn't in the file."""
+        if not self.clustered:
+            raise SurveyFormatError(
+                "resolution is only tracked for clustered candidate files.")
+        with self._lock:
+            self._refresh()
+            row = self._index.get(system_key(system_name))
+            if row is None:
+                return False
+            if row[RESOLUTION] != value:
+                row[RESOLUTION] = value
+                self._dirty = True
+            return True
+
     # ── Handlers (return True if a cell changed) ───────────────────────────────
 
     def _on_arrival(self, ev: dict, ts: str) -> bool:
@@ -211,6 +344,8 @@ class SurveyTracker:
         row = self._index.get(key)
         if row is None:
             return False
+        if row.get("survey_region"):
+            self._active_region = row["survey_region"]
         return self._fill(row, "visited_utc", ts) | self._fill_region(row, key)
 
     def _on_scan(self, ev: dict, ts: str) -> bool:
@@ -284,42 +419,165 @@ class SurveyTracker:
 
     def _append_serendipitous(self, name: str) -> dict:
         row = {f: "" for f in self._fields}
-        row.update(system_name=name, edsm_status="not_in_edsm", direction="serendipitous")
+        parts = {"system_name": name, "edsm_status": "not_in_edsm",
+                 "direction": "serendipitous"}
         p = parse_system_name(name)
         if p:
-            parts = {
+            parts.update({
                 "family":      f"{p['sector']} {p['subsector']}",
                 "subsector":   p["subsector"],
                 "mass_prefix": f"{p['mass_code']}{p['boxel']}",
                 "mass_code":   p["mass_code"],
                 "boxel":       str(p["boxel"]),
                 "number":      str(p["number"]),
-            }
-            row.update({k: v for k, v in parts.items() if k in row})
+                "boxel_id":    f"{p['subsector']} {p['mass_code']}{p['boxel']}",
+            })
+        # Only columns this CSV actually has.
+        row.update({k: v for k, v in parts.items() if k in row})
         self._rows.append(row)
         self._index[system_key(name)] = row
         log.info("Survey: serendipitous undiscovered system %s appended.", name)
         return row
+
+    # ── Survey regions (clustered files) ───────────────────────────────────────
+
+    def _resolve_claims(self, regions: "list[str] | None") -> "list[str]":
+        """Survey regions that count toward legs/completion, in file order."""
+        if not self.clustered:
+            return []
+        in_file = list(dict.fromkeys(r["survey_region"] for r in self._rows if r["survey_region"]))
+        if not regions:
+            return in_file
+        wanted = [r.upper().strip() for r in regions]
+        missing = [r for r in wanted if r not in in_file]
+        if missing:
+            log.warning("Survey: claimed region(s) %s not found in %s", missing, self.path.name)
+        return [r for r in in_file if r in wanted]
+
+    @property
+    def regions(self) -> "list[str]":
+        """Claimed survey regions (all regions in the file if none claimed)."""
+        return list(self._claimed)
+
+    def _resolved(self, row: dict) -> bool:
+        return bool(row.get(RESOLUTION) or row[self._explored_col])
+
+    def region_progress(self) -> "dict[str, tuple[int, int]]":
+        """{region: (resolved, total)} for the claimed regions."""
+        with self._lock:
+            prog = {r: [0, 0] for r in self._claimed}
+            for row in self._rows:
+                p = prog.get(row.get("survey_region", ""))
+                if p is not None:
+                    p[1] += 1
+                    p[0] += self._resolved(row)
+            return {r: (done, total) for r, (done, total) in prog.items()}
+
+    def complete_regions(self) -> "list[str]":
+        """Claimed regions whose every row is resolved (re-reads edits first)."""
+        with self._lock:
+            self._refresh()
+            return [r for r, (done, total) in self.region_progress().items() if done == total]
+
+    def region_rows(self, regions: "list[str]") -> "tuple[list[str], list[list[str]]]":
+        """(headers, rows) for the given survey regions, in file order."""
+        with self._lock:
+            wanted = set(regions)
+            return list(self._fields), [
+                [r[f] for f in self._fields]
+                for r in self._rows if r.get("survey_region") in wanted
+            ]
+
+    def next_target(self) -> "dict | None":
+        """Lowest-visit_order unresolved row in the active region, else in the
+        other claimed regions.  Route order, not distance."""
+        if not self.clustered:
+            return None
+        with self._lock:
+            claimed = set(self._claimed)
+            pending = [r for r in self._rows
+                       if r["survey_region"] in claimed and r["visit_order"]
+                       and not self._resolved(r)]
+            if not pending:
+                return None
+            active = [r for r in pending if r["survey_region"] == self._active_region]
+            return dict(min(active or pending, key=lambda r: int(r["visit_order"])))
 
     # ── Reporting ──────────────────────────────────────────────────────────────
 
     def summary(self) -> dict[str, int]:
         with self._lock:
             rows = self._rows
-            return {
-                "candidates":    sum(r["direction"] != "serendipitous" for r in rows),
-                "serendipitous": sum(r["direction"] == "serendipitous" for r in rows),
+            s = {
+                "candidates":    sum(r.get("direction") != "serendipitous" for r in rows),
+                "serendipitous": sum(r.get("direction") == "serendipitous" for r in rows),
                 "visited":       sum(bool(r["visited_utc"]) for r in rows),
                 "new":           sum(r["discovered"] == "new" for r in rows),
                 "discovered":    sum(r["discovered"] == "discovered" for r in rows),
                 "completed":     sum(bool(r["completed"]) for r in rows),
             }
+            if self.clustered:
+                prog = self.region_progress()
+                s["resolved"]          = sum(self._resolved(r) for r in rows)
+                s["not_found"]         = sum(r[RESOLUTION] == "not_found" for r in rows)
+                s["regions_claimed"]   = len(prog)
+                s["regions_complete"]  = sum(d == t for d, t in prog.values())
+            return s
+
+    def short_status(self) -> str:
+        """Compact progress for the tray tooltip."""
+        with self._lock:
+            if not self.clustered:
+                return f"Survey {self.summary()['completed']} done"
+            region = self._focus_region()
+            if region is None:
+                return "Survey: all claimed regions complete"
+            done, total = self.region_progress()[region]
+            return f"{region} {done}/{total}"
+
+    def _focus_region(self) -> "str | None":
+        """Active region if it's claimed and unfinished, else the next target's."""
+        prog = self.region_progress()
+        if self._active_region in prog:
+            done, total = prog[self._active_region]
+            if done < total:
+                return self._active_region
+        nxt = self.next_target()
+        return nxt["survey_region"] if nxt else None
 
     def summary_text(self) -> str:
         s = self.summary()
-        return (f"Survey: {s['completed']}/{s['candidates'] + s['serendipitous']} complete  |  "
-                f"{s['new']} new, {s['discovered']} pre-discovered  |  "
-                f"+{s['serendipitous']} serendipitous")
+        if not self.clustered:
+            return (f"Survey: {s['completed']}/{s['candidates'] + s['serendipitous']} complete  |  "
+                    f"{s['new']} new, {s['discovered']} pre-discovered  |  "
+                    f"+{s['serendipitous']} serendipitous")
+        with self._lock:
+            parts = []
+            region = self._focus_region()
+            if region:
+                done, total = self.region_progress()[region]
+                parts.append(f"{region}: {done}/{total} resolved")
+            nxt = self.next_target()
+            if nxt:
+                parts.append(f"next #{nxt['visit_order']} {nxt['system_name']}")
+            parts.append(f"regions {s['regions_complete']}/{s['regions_claimed']} complete")
+            parts.append(f"{s['new']} new, {s['not_found']} not found, "
+                         f"+{s['serendipitous']} serendipitous")
+            return "  |  ".join(parts)
+
+
+def make_survey(cfg: dict, on_write_blocked: "Callable[[str], None] | None" = None
+                ) -> "SurveyTracker | None":
+    """SurveyTracker for cfg's [survey] block, or None if there isn't one."""
+    survey_cfg = cfg.get("survey") or {}
+    if not survey_cfg.get("csv_path"):
+        return None
+    return SurveyTracker(
+        survey_cfg["csv_path"], cfg["sector"],
+        on_write_blocked=on_write_blocked,
+        regions=survey_cfg.get("regions"),
+        complete_when=survey_cfg.get("region_complete_when", "completed"),
+    )
 
 
 def replay_events(survey: SurveyTracker, events: "list[tuple[str, str]]") -> None:

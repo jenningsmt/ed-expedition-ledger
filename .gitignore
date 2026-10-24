@@ -9,3 +9,5 @@ output_*/
 *.tmp
 tracker.ico
 ledger.ico
+*.db-shm
+*.db-wal

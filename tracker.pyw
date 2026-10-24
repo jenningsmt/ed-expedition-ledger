@@ -7,6 +7,8 @@ Entry point.  Run via:
   python     tracker.pyw --validate  # invariants + baseline comparison
   python     tracker.pyw --snapshot  # regenerate validation_baseline.json
   python     tracker.pyw --survey-rebuild  # replay stored events into the survey CSV
+  python     tracker.pyw --survey-resolve "<system>" [...] [--as not_found]
+  python     tracker.pyw --close-leg "<name>"     # close the open leg + export
 
 Pass --config <file.toml> to run a different expedition (e.g. a sector survey).
 
@@ -44,6 +46,9 @@ def _setup_logging(verbose: bool = False, to_console: bool = False) -> None:
         )
     ]
     if to_console:
+        # Windows consoles default to cp1252; don't crash on "→" in log lines.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
 
@@ -134,7 +139,7 @@ def _run_cli(cfg: dict) -> None:
     from engine.parser   import EventParser
     from engine.watcher  import JournalWatcher
     from engine.exporter import export_for_config
-    from engine.survey   import SurveyTracker
+    from engine.survey   import make_survey
 
     log = logging.getLogger("cli")
     db  = Database(cfg["db_path"])
@@ -143,21 +148,19 @@ def _run_cli(cfg: dict) -> None:
     legs   = LegManager(db, cfg)
     legs.ensure_first_leg()
 
+    survey = make_survey(cfg, on_write_blocked=log.warning)
+    if survey:
+        survey.autoflush = False
+
     def on_leg_close(leg_id: int) -> None:
         log.info("Leg %d closed -- exporting ...", leg_id)
-        export_for_config(cfg, db, leg_id)
+        export_for_config(cfg, db, leg_id, survey=survey)
 
     def export_active() -> None:
         leg = db.get_active_leg()
         if leg is not None:
             log.info("Exporting %s ...", leg["name"] or f"Leg {leg['ordinal']}")
-            export_for_config(cfg, db, leg["leg_id"])
-
-    survey = None
-    if (cfg.get("survey") or {}).get("csv_path"):
-        survey = SurveyTracker(cfg["survey"]["csv_path"], cfg["sector"],
-                               on_write_blocked=log.warning)
-        survey.autoflush = False
+            export_for_config(cfg, db, leg["leg_id"], survey=survey)
 
     parser  = EventParser(db, legs, cfg, on_leg_close=on_leg_close, survey=survey,
                           on_session_end=export_active if sector_mode else None)
@@ -430,10 +433,10 @@ def _run_survey_rebuild(cfg: dict) -> None:
     Stop the tracker first so the two don't write the CSV at the same time.
     """
     from engine.db     import Database
-    from engine.survey import SurveyTracker, replay_events
+    from engine.survey import make_survey, replay_events
 
-    survey_cfg = cfg.get("survey") or {}
-    if not survey_cfg.get("csv_path"):
+    survey = make_survey(cfg)
+    if survey is None:
         print("No [survey] csv_path in this config -- nothing to rebuild.")
         sys.exit(1)
     if not Path(cfg["db_path"]).exists():
@@ -447,7 +450,6 @@ def _run_survey_rebuild(cfg: dict) -> None:
     ))
     db.close()
 
-    survey = SurveyTracker(survey_cfg["csv_path"], cfg["sector"])
     replay_events(survey, events)
     if survey.flush():
         print(f"Replayed {len(events):,} events into {survey.path}")
@@ -455,6 +457,68 @@ def _run_survey_rebuild(cfg: dict) -> None:
     else:
         print(f"Could not write {survey.path} -- is it open in Excel?")
         sys.exit(1)
+
+
+def _run_survey_resolve(cfg: dict, systems: "list[str]", value: str) -> None:
+    """Set the resolution column for systems in a clustered survey CSV.
+
+    Safe while the tracker is running: it merges edits made to the file
+    before its next write, and the resolution column always takes the value
+    on disk.  value "clear" empties the cell.
+    """
+    from engine.survey import SurveyFormatError, make_survey
+
+    survey = make_survey(cfg)
+    if survey is None:
+        print("No [survey] csv_path in this config.")
+        sys.exit(1)
+    value = "" if value.lower() == "clear" else value
+    unknown = []
+    try:
+        for name in systems:
+            if not survey.resolve(name, value):
+                unknown.append(name)
+    except SurveyFormatError as exc:
+        print(exc)
+        sys.exit(1)
+    if not survey.flush():
+        print(f"Could not write {survey.path} -- is it open in Excel?")
+        sys.exit(1)
+    done = len(systems) - len(unknown)
+    print(f"{done} system(s) set to {value or '(cleared)'!r} in {survey.path.name}")
+    for name in unknown:
+        print(f"  not in the candidate file: {name}")
+    print(survey.summary_text())
+    if unknown:
+        sys.exit(1)
+
+
+# ── Manual leg close ───────────────────────────────────────────────────────────
+
+def _run_close_leg(cfg: dict, name: str) -> None:
+    """Close the open leg under the given name, open the next, and export
+    the closed leg.  Stop the tracker first."""
+    from engine.db       import Database
+    from engine.exporter import export_for_config
+    from engine.legs     import LegManager
+    from engine.survey   import make_survey
+
+    if not Path(cfg["db_path"]).exists():
+        print(f"No database at {cfg['db_path']} -- nothing to close.")
+        sys.exit(1)
+    db = Database(cfg["db_path"])
+    try:
+        legs = LegManager(db, cfg)
+        leg = db.get_active_leg()
+        if leg is None:
+            print("No open leg to close.")
+            sys.exit(1)
+        closed_id = legs.manual_close(label=name)
+        xlsx = export_for_config(cfg, db, closed_id, survey=make_survey(cfg))
+        print(f"Leg {leg['ordinal']} closed as {name!r} and exported -> {xlsx.name}")
+        print(f"Leg {leg['ordinal'] + 1} is now open.")
+    finally:
+        db.close()
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -514,11 +578,19 @@ def main() -> None:
     ap.add_argument("--reset",    action="store_true", help="Delete all expedition data (keeps config.toml)")
     ap.add_argument("--survey-rebuild", action="store_true",
                     help="Replay stored events into the [survey] CSV")
+    ap.add_argument("--survey-resolve", nargs="+", metavar="SYSTEM",
+                    help="Set the resolution of these systems in a clustered survey CSV")
+    ap.add_argument("--as", dest="resolve_as", default="not_found", metavar="VALUE",
+                    help="Resolution for --survey-resolve: not_found (default), "
+                         "done_by_other, or clear")
+    ap.add_argument("--close-leg", metavar="NAME",
+                    help="Close the open leg under NAME, open the next, export it")
     ap.add_argument("--config",   default=str(ROOT / "config.toml"), help="Path to config.toml")
     ap.add_argument("--verbose",  action="store_true", help="Debug-level logging")
     args = ap.parse_args()
 
-    to_console = args.cli or args.validate or args.snapshot or args.reset or args.survey_rebuild
+    to_console = (args.cli or args.validate or args.snapshot or args.reset
+                  or args.survey_rebuild or args.survey_resolve or args.close_leg)
     _setup_logging(verbose=args.verbose, to_console=to_console)
 
     from engine.config import load as load_cfg
@@ -530,6 +602,10 @@ def main() -> None:
 
     if args.survey_rebuild:
         _run_survey_rebuild(cfg)
+    elif args.survey_resolve:
+        _run_survey_resolve(cfg, args.survey_resolve, args.resolve_as)
+    elif args.close_leg:
+        _run_close_leg(cfg, args.close_leg)
     elif args.snapshot:
         _run_snapshot(cfg)
     elif args.validate:

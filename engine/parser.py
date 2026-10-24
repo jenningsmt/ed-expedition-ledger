@@ -150,13 +150,6 @@ class EventParser:
                 )
                 return False
 
-        # ── Sector survey ──────────────────────────────────────────────────────
-        if self._survey is not None:
-            try:
-                self._survey.on_event(ev, self._session_commander_name)
-            except Exception:
-                log.exception("Survey error handling %s event at %s", event_type, ts_str)
-
         # ── Dispatch ───────────────────────────────────────────────────────────
         handler = getattr(self, f"_on_{event_type}", None)
         if handler:
@@ -165,9 +158,34 @@ class EventParser:
             except Exception:
                 log.exception("Error handling %s event at %s", event_type, ts_str)
 
+        # ── Sector survey ──────────────────────────────────────────────────────
+        # After dispatch, so the FSDJump handler's region-complete check sees
+        # the survey as it stood before this jump (close on the jump *away*).
+        if self._survey is not None:
+            try:
+                self._survey.on_event(ev, self._session_commander_name)
+            except Exception:
+                log.exception("Survey error handling %s event at %s", event_type, ts_str)
+
         return True
 
     # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _close_completed_regions(self, from_system: str, ts: str) -> None:
+        """Departure check for clustered survey files: close a leg for any
+        claimed survey region that is complete but not yet closed."""
+        if self._survey is None or not self._survey.regions:
+            return
+        complete = self._survey.complete_regions()
+        closed   = self.db.get_visited_waypoints()
+        pending  = [r for r in complete if r not in closed]
+        if not pending:
+            return
+        all_done = len(complete) == len(self._survey.regions)
+        result = self.legs.on_regions_complete(pending, from_system, ts, all_done)
+        closed_id = result["leg_id_closed"]
+        if self._on_leg_close and closed_id is not None:
+            self._on_leg_close(closed_id)
 
     def _set_session_commander(self, name: str) -> None:
         self._session_commander_name = name.strip() or None
@@ -207,6 +225,7 @@ class EventParser:
                 closed_id = result["leg_id_closed"]
                 if self._on_leg_close and closed_id is not None:
                     self._on_leg_close(closed_id)
+            self._close_completed_regions(self._current_system, ts)
 
         # leg_id is now the active leg — either unchanged or the freshly opened one.
         leg_id = self._active_leg_id()

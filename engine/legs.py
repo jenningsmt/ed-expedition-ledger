@@ -147,6 +147,41 @@ class LegManager:
             "leg_id_closed": old_leg_id,
         }
 
+    def on_regions_complete(
+        self, regions: "list[str]", from_system: str, ts: str, all_done: bool,
+    ) -> dict:
+        """
+        Called on an FSDJump away from from_system when survey regions have
+        become complete since their leg was last closed (sector mode with a
+        clustered candidate file).  Mirrors on_depart: the active leg closes
+        named after the region(s) ("R01", or "R01 + R02" if several finished
+        together) and the next leg opens — unless all_done, in which case the
+        expedition is marked complete.  Closed regions are recorded in
+        waypoints_visited so they never close again, even after a restart.
+        """
+        if self._expedition_complete or not regions:
+            return {"action": "none", "waypoint_label": None, "leg_id_closed": None}
+        leg = self.db.get_active_leg()
+        if leg is None:
+            return {"action": "none", "waypoint_label": None, "leg_id_closed": None}
+
+        label = " + ".join(regions)
+        self.db.close_leg(leg["leg_id"], from_system, ts, name=label)
+        for region in regions:
+            self.db.mark_waypoint_visited(region, from_system, ts)
+
+        if all_done:
+            self._expedition_complete = True
+            log.info("Survey regions %s complete — Leg %d closed; EXPEDITION COMPLETE.",
+                     label, leg["ordinal"])
+            action = "expedition_complete"
+        else:
+            self.db.open_leg(leg["ordinal"] + 1, None, from_system, ts)
+            log.info("Survey regions %s complete — Leg %d closed, Leg %d opened.",
+                     label, leg["ordinal"], leg["ordinal"] + 1)
+            action = "region_close"
+        return {"action": action, "waypoint_label": label, "leg_id_closed": leg["leg_id"]}
+
     # ── Manual close ───────────────────────────────────────────────────────────
 
     def manual_close(self, ts: str | None = None, label: str | None = None) -> int | None:

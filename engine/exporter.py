@@ -24,14 +24,19 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 from .db import Database
+
+if TYPE_CHECKING:
+    from .survey import SurveyTracker
 
 log = logging.getLogger(__name__)
 
@@ -81,9 +86,16 @@ def _leg_slug(leg) -> str:
     return f"Leg{leg['ordinal']:02d}_{name}_{date}"
 
 
-def sector_slug(sector: str, as_of: str) -> str:
-    """File stem for a sector-survey export, e.g. sector_hypiae_aim_2026-10-23."""
-    return f"sector_{sector.lower().strip().replace(' ', '_')}_{as_of}"
+def sector_slug(sector: str, as_of: str, leg_name: "str | None" = None) -> str:
+    """File stem for a sector-survey export.
+
+    Open (cumulative) leg:  sector_hypiae_aim_2026-10-23
+    Closed leg:             sector_hypiae_aim_r01_2026-10-25
+    """
+    stem = f"sector_{sector.lower().strip().replace(' ', '_')}"
+    if leg_name:
+        stem += "_" + re.sub(r"[^a-z0-9]+", "_", leg_name.lower()).strip("_")
+    return f"{stem}_{as_of}"
 
 
 def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
@@ -102,14 +114,18 @@ def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
 
 def export_leg(leg_id: int, db: Database, output_dir: Path,
                suffix: str = "", waypoint_systems: "set[str] | None" = None,
-               slug: "str | None" = None, as_of: "str | None" = None) -> Path:
+               slug: "str | None" = None, as_of: "str | None" = None,
+               extra_sheets: "list[tuple[str, str, list[str], list[list]]] | None" = None,
+               ) -> Path:
     """Export one leg to xlsx + CSVs.  Returns the xlsx path.
 
     Pass suffix (e.g. '_snapshot_20260603T014500') to distinguish an
     on-demand snapshot from the final waypoint-close export.
 
     Pass slug to override the file stem entirely (sector mode), and as_of
-    to add an "As of (UTC)" row to the Summary sheet.
+    to add an "As of (UTC)" row to the Summary sheet.  extra_sheets is a list
+    of (sheet name, csv suffix, headers, rows) appended after the standard
+    sheets, each also written as <slug>_<csv suffix>.csv.
 
     Pass waypoint_systems (normalised/lowercased system names, from
     cfg["waypoint_map"] when config.toml's waypoints_only_export is true) to
@@ -318,6 +334,10 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     _add_sheet(wb, "Sales", sales_headers, sales_rows)
     _write_csv(output_dir / f"{slug}_sales.csv", sales_headers, sales_rows)
 
+    for sheet_name, csv_suffix, headers, rows in extra_sheets or []:
+        _add_sheet(wb, sheet_name, headers, rows)
+        _write_csv(output_dir / f"{slug}_{csv_suffix}.csv", headers, rows)
+
     wb.save(str(xlsx_p))
     log.info("Exported leg %d -> %s", leg_id, xlsx_p.name)
     return xlsx_p
@@ -486,13 +506,17 @@ def export_master_rollup(
     return xlsx_p
 
 
-def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "") -> Path:
+def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "",
+                      survey: "SurveyTracker | None" = None) -> Path:
     """Run the rarity pass, then export one leg + the master rollup using the
     naming and filter rules from cfg.  Returns the leg xlsx path.
 
     Waypoint mode: Leg##_<name>_<start date><suffix>.
-    Sector mode:   sector_<sector>_<as-of date> — cumulative, so re-exporting
-                   on the same UTC day overwrites that day's files.
+    Sector mode:   open leg → sector_<sector>_<as-of date>, so re-exporting on
+                   the same UTC day overwrites that day's files;
+                   closed leg → sector_<sector>_<leg name>_<close date>.
+    A closed survey-region leg ("R01", "R01 + R02") also gets a Candidates
+    sheet listing that region's rows from the survey CSV.
     """
     from .rarity import run_rarity_pass
     run_rarity_pass(db, cfg.get("rarity", {}))
@@ -500,9 +524,21 @@ def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "") ->
     out = Path(cfg["output_dir"])
     wp  = set(cfg["waypoint_map"]) if cfg.get("waypoints_only_export", False) else None
     if cfg.get("mode") == "sector":
-        as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        leg = db.get_leg(leg_id)
+        extra = []
+        if survey is not None and leg["name"]:
+            regions = [r for r in leg["name"].split(" + ") if r in survey.regions]
+            if regions:
+                headers, rows = survey.region_rows(regions)
+                extra.append(("Candidates", "candidates", headers, rows))
+        if leg["end_ts"]:
+            slug  = sector_slug(cfg["sector"], leg["end_ts"][:10], leg["name"] or f"leg{leg['ordinal']:02d}")
+            as_of = None
+        else:
+            as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            slug  = sector_slug(cfg["sector"], as_of)
         xlsx_p = export_leg(leg_id, db, out, waypoint_systems=wp,
-                            slug=sector_slug(cfg["sector"], as_of), as_of=as_of)
+                            slug=slug, as_of=as_of, extra_sheets=extra)
     else:
         xlsx_p = export_leg(leg_id, db, out, suffix=suffix, waypoint_systems=wp)
     export_master_rollup(db, out, waypoint_systems=wp)

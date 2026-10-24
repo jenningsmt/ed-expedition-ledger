@@ -197,7 +197,7 @@ route-based expeditions are unaffected.
 ## Sector survey mode
 
 For surveying a whole sector rather than flying to waypoints — e.g. working
-through a sector-surveyor list of systems that likely
+through an ED Sector Surveyor list of systems that likely
 exist but have never been reported to EDSM. A ready-made config is
 `config_hypiae_aim.toml`; run it alongside (not instead of) a waypoint
 expedition, since it has its own database and output folder:
@@ -222,21 +222,42 @@ baseline_path = "validation_baseline_hypiae_aim.json"
 csv_path = 'data/sector-surveyor_output/hypiae_aim_unreported_systems.csv'
 ```
 
+### Two candidate-file formats
+
+The format is detected from the CSV header; there is no config switch.
+
+| Format | File | Header has | Legs |
+|---|---|---|---|
+| **Plain list** | `<sector>_unreported_systems.csv` | `system_name, edsm_status, direction, …` | one open sector leg |
+| **Clustered** (Sector Surveyor 1.6.0+) | `<sector>_candidates_clustered.csv` | `visit_order, survey_region, …` | one leg per survey region (R01…Rnn) — see [Survey regions](#survey-regions-clustered-files) |
+
+Clustered files made by Sector Surveyor builds before 1.6.0 named the
+survey-region column `region`, which collides with the tracker's own
+galactic-region column. The tracker refuses such a file (a `visit_order` /
+`cluster` header with `R01`-style values under `region`) and asks you to
+regenerate it with 1.6.0 or later, rather than overwrite those values.
+
 ### Exploration exports
 
-Sector mode keeps one open leg for the whole survey (there are no waypoints
-or end system). Exports are **cumulative** and named by their *as-of* UTC
-date — `sector_hypiae_aim_2026-10-23.xlsx`, `sector_hypiae_aim_2026-10-23_bodies.csv`,
+Sector mode keeps one open leg at a time (there are no waypoints or end
+system). The open leg's exports are named by their *as-of* UTC date —
+`sector_hypiae_aim_2026-10-23.xlsx`, `sector_hypiae_aim_2026-10-23_bodies.csv`,
 and so on — plus `master_rollup.xlsx`. They refresh after the startup
 backfill, when the game writes its `Shutdown` event, on tray → **Export
 snapshot**, and when the tracker exits. Re-exporting on the same UTC day
 overwrites that day's files; each earlier day's set stays as a snapshot.
+With a plain list the open leg spans the whole survey, so these exports are
+cumulative.
+
+A **closed** leg is exported under its own name and close date, e.g.
+`sector_hypiae_aim_r01_2026-11-02.xlsx` or
+`sector_hypiae_aim_hypiae_aim_pre_regions_2026-10-24.xlsx`.
 Systems and Bodies carry a **Commander** column.
 
 ### Survey CSV tracking
 
-The tracker keeps the sector-surveyor CSV up to date as you fly, adding five
-columns:
+The tracker keeps the candidate CSV up to date as you fly, adding five
+columns (six for clustered files):
 
 | Column | Filled when | Value |
 |---|---|---|
@@ -245,16 +266,31 @@ columns:
 | `region` | arrival | galactic region, e.g. `Elysian Shore` |
 | `visited_utc` | first arrival | journal timestamp |
 | `completed_utc` | `FSSAllBodiesFound` | journal timestamp |
+| `resolution` | *clustered only* — set by you | `not_found`, `done_by_other`, … |
 
 - **Serendipitous systems** — an undiscovered system in the sector that
-  isn't in the CSV is appended with `direction = serendipitous`,
+  isn't in the CSV is appended at the end with `direction = serendipitous`,
   `edsm_status = not_in_edsm`, and family/subsector/mass/boxel/number parsed
-  from its name. Already-discovered systems not in the CSV are ignored, as
-  are undiscovered systems outside the sector.
-- **First value wins** — a filled cell is never overwritten, so a revisit
-  after the data was sold (now "discovered"), or the other commander
-  finishing a system second, doesn't change the record. Manual edits are
-  kept too.
+  from its name (only for columns the file has). In a clustered file it has
+  no `survey_region` or `visit_order`, so it never belongs to a region leg.
+  Already-discovered systems not in the CSV are ignored, as are undiscovered
+  systems outside the sector.
+- **First value wins** — a filled tracker cell is never overwritten, so a
+  revisit after the data was sold (now "discovered"), or the other commander
+  finishing a system second, doesn't change the record.
+- **Editing the file while the tracker runs** is safe. Before each write
+  (and before each region check) the tracker re-reads the file if its
+  modification time changed and merges your edits:
+  - `resolution` and the Sector Surveyor columns take **your** value — so
+    clearing a mistaken `not_found` works;
+  - the tracker's own five columns keep the tracker's value when it has
+    one, and take yours only if its cell is empty — so Excel reformatting
+    `visited_utc` on save, say, is undone on the next write;
+  - added columns and hand-added rows are kept. Deleting a row the tracker
+    still holds doesn't stick: it is written back.
+
+  Excel locks the file while it's open, so edits made there land when you
+  save **and close** it.
 - **Region** comes from the game's `CodexEntry` when one fires in the system
   (authoritative), otherwise from the star's coordinates via
   [klightspeed's region map](https://github.com/klightspeed/EliteDangerousRegionMap)
@@ -268,18 +304,107 @@ columns:
   in binary systems.
 - **Name matching** treats the game's short form `Hypiae Aim NA-A d3` as
   equal to `Hypiae Aim NA-A d0-3`.
-- **Writes are atomic** (temp file + replace) and keep the file's UTF-8 BOM
-  and line endings. The untouched original is kept once as `*.orig.csv`.
+- **Writes are atomic** (temp file + replace) and keep the file's row order,
+  UTF-8 BOM (or lack of one) and line endings. The untouched original is
+  kept once as `*.orig.csv`.
 - **Open in Excel?** Excel locks the file. Updates are held in memory, a tray
   notification says so, and the write is retried every 30 s until the file
   is closed. Open a *copy* if you want to browse it mid-session.
 
-**Replacing the CSV** (e.g. after re-running sector-surveyor): stop the
+**Replacing the CSV** (e.g. after re-running Sector Surveyor): stop the
 tracker, drop in the new file, then replay everything already flown:
 
 ```
 python tracker.pyw --config config_hypiae_aim.toml --survey-rebuild
 ```
+
+The rebuild only fills the CSV; it doesn't touch legs or exports. Values
+already in the new file are kept, and `resolution` marks aren't journal
+events, so they aren't replayed — carry them over by hand or with
+`--survey-resolve`.
+
+### Survey regions (clustered files)
+
+A clustered file from Sector Surveyor 1.6.0+ lists every candidate in a
+planned route order (`visit_order` 1…N) and groups them into **survey
+regions** R01…Rnn. Each region is a unit of work: when every candidate in it
+is **resolved**, the tracker closes the active leg named after the region
+(`R01`), exports it, and opens the next — the same way reaching a waypoint
+does.
+
+```toml
+[survey]
+csv_path = 'data/input_data/hypiae_aim_candidates_clustered.csv'
+regions  = ['R01', 'R14']              # optional claim filter (default: all regions)
+region_complete_when = 'completed'     # or 'visited'
+```
+
+- **Resolved** means *explored* or *marked*. Explored follows
+  `region_complete_when`: `completed` (default) needs `FSSAllBodiesFound`,
+  i.e. a full FSS; `visited` only needs an arrival. Marked means any
+  non-empty `resolution`.
+- **Marking candidates.** Many candidates don't exist — the game never used
+  that name, and nothing in the journal says so. Mark them so their region
+  can close. Use `not_found` for a name the galaxy map doesn't find, and
+  `done_by_other` for one a squadmate explored (their journals aren't
+  yours). Type it into the `resolution` column, or from the command line —
+  safe while the tracker runs:
+
+  ```
+  python tracker.pyw --config config_hypiae_aim.toml --survey-resolve "Hypiae Aim XD-R c18-1" "Hypiae Aim XD-R c18-0"
+  python tracker.pyw --config config_hypiae_aim.toml --survey-resolve "Hypiae Aim XD-R c18-1" --as done_by_other
+  python tracker.pyw --config config_hypiae_aim.toml --survey-resolve "Hypiae Aim XD-R c18-1" --as clear
+  ```
+- **When a leg closes.** On the next FSDJump *away* after the region becomes
+  complete — as with waypoints — so scans and sales made in the last system
+  land in the closing leg. Regions can be finished in any order. If several
+  finish together they close one leg, e.g. `R01 + R02`. A region never
+  closes twice, even after a restart. When every claimed region has closed,
+  the expedition is marked complete; the CSV is still updated after that.
+- **Claim filter.** With `regions` set, only those regions get legs and
+  count toward completion. Rows from other regions are still tracked if you
+  visit them. Leave it out to work the whole file — so a squadron member can
+  load the full shared file rather than splitting it.
+- **Rows without a region** (candidates Sector Surveyor couldn't place, and
+  serendipitous systems) are tracked but never hold up a region.
+- **Legs are time slices, not region slices.** A leg holds everything
+  flown since the previous leg closed. If you alternate between R01 and
+  R14, the leg named `R14` also has those R01 jumps, scans and sales.
+  Systems and Bodies aren't filtered by region, so serendipitous and
+  in-transit finds stay in. Each closed region leg also gets a
+  **Candidates** sheet (and `_candidates.csv`) listing that region's rows
+  and their status.
+- **Progress and next target.** Tray → **Survey progress** (and `--cli` at
+  start-up) shows e.g.
+  `R14: 6/260 resolved | next #2673 Hypiae Aim XD-R c18-1 | regions 0/55 complete | …`.
+  The tooltip shows `R14 6/260`. The active region is the one holding the
+  candidate you visited last. The next target is its lowest unresolved
+  `visit_order`, else the lowest in your other claimed regions. That's
+  route order, not distance from where you are.
+
+### Moving a plain-list survey to a clustered file
+
+Close the leg that holds the survey so far under a name of your choice, so
+the first region leg doesn't absorb everything flown before regions existed.
+Then point the config at the clustered file and replay your progress into it:
+
+1. Stop the tracker (tray → **Stop & exit**).
+2. Close the open leg; this exports it as
+   `sector_hypiae_aim_hypiae_aim_pre_regions_<date>.*` and opens the next leg:
+   ```
+   python tracker.pyw --config config_hypiae_aim.toml --close-leg "Hypiae Aim (pre-regions)"
+   ```
+3. In `config_hypiae_aim.toml`, set `[survey] csv_path` to the clustered file
+   (and `regions` if you've claimed some).
+4. Replay the progress already flown into it:
+   ```
+   python tracker.pyw --config config_hypiae_aim.toml --survey-rebuild
+   ```
+5. Start the tracker. The next leg to close is named after the first region
+   you finish.
+
+`--close-leg NAME` also works on its own in any mode: it closes the open leg
+under `NAME`, opens the next and exports the closed one.
 
 ---
 

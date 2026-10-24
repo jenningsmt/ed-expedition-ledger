@@ -25,7 +25,7 @@ from engine.legs     import LegManager
 from engine.parser   import EventParser
 from engine.watcher  import JournalWatcher
 from engine.exporter import export_for_config
-from engine.survey   import SurveyTracker
+from engine.survey   import SurveyTracker, make_survey
 
 if TYPE_CHECKING:
     pass
@@ -70,12 +70,8 @@ class TrackerTray:
         self._db   = db
         self._legs = LegManager(db, cfg)
         self._sector_mode = cfg.get("mode") == "sector"
-        survey_cfg = cfg.get("survey") or {}
-        self._survey: SurveyTracker | None = None
-        if survey_cfg.get("csv_path"):
-            self._survey = SurveyTracker(
-                survey_cfg["csv_path"], cfg["sector"], on_write_blocked=self._notify,
-            )
+        self._icon: pystray.Icon | None = None
+        self._survey: SurveyTracker | None = make_survey(cfg, on_write_blocked=self._notify)
         self._parser = EventParser(
             db, self._legs, cfg,
             on_leg_close=self._on_leg_close,
@@ -87,7 +83,6 @@ class TrackerTray:
             db=db,
             parser=self._parser,
         )
-        self._icon: pystray.Icon | None = None
         self._lock = threading.Lock()
 
     # ── pystray entry ──────────────────────────────────────────────────────────
@@ -187,7 +182,8 @@ class TrackerTray:
         suffix = f"_snapshot_{ts}"
         out    = Path(self._cfg["output_dir"])
         try:
-            xlsx_path = export_for_config(self._cfg, self._db, leg["leg_id"], suffix=suffix)
+            xlsx_path = export_for_config(self._cfg, self._db, leg["leg_id"], suffix=suffix,
+                                          survey=self._survey)
             msg = f"Snapshot saved: {xlsx_path.name}"
             log.info(msg)
             try:
@@ -227,7 +223,7 @@ class TrackerTray:
 
     def _export_leg(self, leg_id: int) -> None:
         try:
-            export_for_config(self._cfg, self._db, leg_id)
+            export_for_config(self._cfg, self._db, leg_id, survey=self._survey)
         except Exception:
             log.exception("Export failed for leg %d.", leg_id)
 
@@ -243,10 +239,11 @@ class TrackerTray:
         if text is None:
             text = self._legs.status_text()
             if self._survey:
-                text += f"  |  Survey {self._survey.summary()['completed']} done"
+                text += f"  |  {self._survey.short_status()}"
         if self._icon:
             try:
-                self._icon.title = f"ED Expedition Ledger — {text}"
+                # Windows tooltips hold at most 127 characters.
+                self._icon.title = f"ED Expedition Ledger — {text}"[:127]
             except Exception:
                 pass
 

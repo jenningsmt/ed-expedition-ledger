@@ -51,9 +51,17 @@ def load(config_path: Path) -> dict:
     raw.setdefault("mode", "waypoints")
     if raw["mode"] == "sector" and not raw.get("sector"):
         raise ValueError("mode = 'sector' requires a `sector` name in the config.")
+    # Clustered candidate files (Sector Surveyor 1.6.0+) may also set:
+    #   regions = ["R01", "R14"]           claimed survey regions (default: all)
+    #   region_complete_when = "completed" | "visited"
     survey = raw.get("survey")
     if survey and survey.get("csv_path"):
         survey["csv_path"] = _expand(survey["csv_path"], root)
+        when = survey.setdefault("region_complete_when", "completed")
+        if when not in ("completed", "visited"):
+            raise ValueError("[survey] region_complete_when must be 'completed' or 'visited'.")
+        if "regions" in survey:
+            survey["regions"] = [str(r).upper().strip() for r in survey["regions"]]
 
     # ── Timestamp cutoff ───────────────────────────────────────────────────────
     raw["expedition_start_dt"] = datetime.fromisoformat(
