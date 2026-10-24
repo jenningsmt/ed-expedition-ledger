@@ -34,6 +34,46 @@ waypoint.
 
 ## Install
 
+### Windows app (recommended)
+
+Run `EDLedger-Setup-1.0.0.exe`. It installs per user (no admin rights) to
+`%LOCALAPPDATA%\Programs\EDLedger`, adds **ED Expedition Ledger** to the
+Desktop and Start menu (plus a Start-menu **Configure expedition** entry), and
+needs no Python. The app isn't code-signed, so Windows SmartScreen may ask you
+to confirm the first time ("More info" → "Run anyway").
+
+On first launch the configuration window opens: set the expedition up and
+click **Save**, and the tracker starts in the system tray. Everything you
+create lives outside the install folder, so re-running a newer installer
+upgrades in place and never touches it:
+
+| What | Where |
+|---|---|
+| Expedition config | `%APPDATA%\EDLedger\config.toml` |
+| Database, log, validation baseline | `%LOCALAPPDATA%\EDLedger\` |
+| Exports (default; changeable in the config window) | `%LOCALAPPDATA%\EDLedger\output\` |
+
+Tray → **Open output folder** opens the exports. The command-line functions
+(`--survey-resolve`, `--close-leg`, `--survey-rebuild`, `--cli`, `--validate`)
+are in the console build next to the app:
+
+```
+"%LOCALAPPDATA%\Programs\EDLedger\EDLedger-cli.exe" --survey-resolve "Hypiae Aim XD-R c18-1"
+```
+
+It uses the installed app's config unless you pass `--config`.
+
+**Building the installer** (needs Python 3.11+, the packages in
+`requirements.txt` and `requirements-build.txt`, and
+[Inno Setup 6](https://jrsoftware.org/isdl.php)): run `build.bat`. It makes
+`ledger.ico` from `icon.png`, builds the PyInstaller bundle (`EDLedger.spec`:
+`EDLedger.exe` windowed and `EDLedger-cli.exe` console, sharing one
+`_internal` folder) and compiles `installer.iss` into
+`dist-installer\EDLedger-Setup-<version>.exe`. Bump the version in
+`engine/__init__.py`, `version_info.txt` and `installer.iss` together.
+
+### From source
+
 1. **Python 3.11+** required — download from [python.org](https://python.org) if
    needed. Tick **"Add Python to PATH"** during install.
 
@@ -51,8 +91,13 @@ waypoint.
    This checks your Python version, installs dependencies, creates the Desktop
    shortcut, and opens the configuration window.
 
-4. In the configuration window, fill in your commander name, journal folder,
-   and expedition route, then click **Save**.
+4. In the configuration window, fill in your commander name(s), journal
+   folder, and expedition (waypoint route or sector survey), then click
+   **Save**.
+
+A source run keeps everything in the repo folder (`config.toml`,
+`tracker.db`, `output/`, `tracker.log`), exactly as before; the installed
+app's folders above aren't used.
 
 ---
 
@@ -390,7 +435,10 @@ Then point the config at the clustered file and replay your progress into it:
 
 1. Stop the tracker (tray → **Stop & exit**).
 2. Close the open leg; this exports it as
-   `sector_hypiae_aim_hypiae_aim_pre_regions_<date>.*` and opens the next leg:
+   `sector_hypiae_aim_hypiae_aim_pre_regions_<date>.*` and opens the next leg.
+   In the app: tray → **Configure expedition…** → **Close current leg…**
+   (it suggests "Hypiae Aim (pre-regions)"; this one works with the tracker
+   running). From source:
    ```
    python tracker.pyw --config config_hypiae_aim.toml --close-leg "Hypiae Aim (pre-regions)"
    ```

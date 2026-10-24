@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as Item, Menu
 
+from engine          import paths, __version__
 from engine.db       import Database
 from engine.legs     import LegManager
 from engine.parser   import EventParser
@@ -101,18 +102,18 @@ class TrackerTray:
         self._icon = pystray.Icon(
             name="ED Expedition Ledger",
             icon=icon_img,
-            title="ED Expedition Ledger",
+            title=f"ED Expedition Ledger {__version__}",
             menu=Menu(
                 Item("Status",                self._show_status),
                 Item("Survey progress",       self._show_survey,
                      visible=self._survey is not None),
                 Item("Export snapshot",       self._export_snapshot),
+                Item("Open output folder",    self._open_output),
+                # Sector mode: name the leg in Configure expedition… → Close current leg.
                 Item("Close leg & export now", self._manual_close,
                      visible=not self._sector_mode),
                 Menu.SEPARATOR,
-                # The config window edits config.toml only, not a sector config.
-                Item("Configure expedition…", self._open_config,
-                     visible=not self._sector_mode),
+                Item("Configure expedition…", self._open_config),
                 Menu.SEPARATOR,
                 Item("Stop & exit",           self._stop_and_exit),
             ),
@@ -196,8 +197,13 @@ class TrackerTray:
             log.exception("Snapshot export failed.")
 
     def _open_config(self, icon, item) -> None:
-        config_script = Path(__file__).parent.parent / "ui" / "config_window.py"
-        subprocess.Popen([sys.executable, str(config_script)])
+        subprocess.Popen(paths.self_command("--configure", "--config", str(self._cfg["config_path"])))
+
+    def _open_output(self, icon, item) -> None:
+        out = Path(self._cfg["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        import os
+        os.startfile(out)
 
     def _stop_and_exit(self, icon, item) -> None:
         log.info("Stop & exit requested.")

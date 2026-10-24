@@ -566,6 +566,18 @@ class SurveyTracker:
             return "  |  ".join(parts)
 
 
+def inspect_candidates(path: Path) -> dict:
+    """Format, row count and survey regions of a candidate CSV, without
+    changing it.  Raises SurveyFormatError / OSError for unusable files."""
+    fields, rows, _, _ = _read_csv(Path(path))
+    if "system_name" not in fields:
+        raise SurveyFormatError("No system_name column — not a Sector Surveyor candidate file.")
+    fmt = detect_format(fields, rows)
+    regions = (list(dict.fromkeys(r["survey_region"] for r in rows if r["survey_region"]))
+               if fmt == "clustered" else [])
+    return {"format": fmt, "rows": len(rows), "regions": regions}
+
+
 def make_survey(cfg: dict, on_write_blocked: "Callable[[str], None] | None" = None
                 ) -> "SurveyTracker | None":
     """SurveyTracker for cfg's [survey] block, or None if there isn't one."""

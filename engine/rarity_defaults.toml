@@ -1,0 +1,70 @@
+# Default rare / notable first-discovery detector settings.
+# Written into new configs by the config window; edit them there.
+[rarity]
+# If true (default), only evaluate bodies where WasDiscovered == false.
+# Set to false to evaluate all scanned bodies regardless of prior discovery.
+flag_only_first_discoveries = true
+
+# Per-rule enable/disable switches
+rule_ringed_habitable  = true   # ELW / WW / AW with rings
+rule_habitable_moon    = true   # ELW / WW / AW orbiting a planet
+rule_life_bearing_gg   = true   # gas giants with water/ammonia life
+rule_very_small        = true   # radius below threshold
+rule_tidal_moon        = true   # volcanic moon orbiting a planet
+rule_jumponium         = true   # geo≥3 + volcanic + ≥1 jumponium material
+rule_exotic_star       = true   # neutron / black hole / white dwarf / WR / HerbigAeBe
+rule_high_gravity      = true   # landable body with surface gravity > threshold
+rule_fast_rotator      = true   # rotation period below threshold (non-tidal-locked)
+rule_ggg_candidate     = true   # gas-giant GGG heuristic (verify visually — false positives expected)
+rule_nsp_alert         = true   # Notable Stellar Phenomena system alert
+
+# Thresholds
+very_small_radius_m   = 300000  # 300 km in metres
+high_gravity_g        = 3.0     # surface gravity threshold in g
+fast_rotator_hours    = 3.0     # rotation period threshold in hours
+geo_signal_threshold  = 3       # minimum geological signal count for the jumponium rule
+
+# Jumponium-synthesis material set (case-insensitive match against journal Names)
+jumponium_materials = [
+    "Carbon", "Vanadium", "Germanium", "Arsenic",
+    "Niobium", "Yttrium", "Polonium"
+]
+
+# Exotic star types — exact match against journal StarType field.
+exotic_star_types = [
+    "N", "H",
+    "DA", "DAB", "DAO", "DAZ", "DAV",
+    "DB", "DBZ", "DBV", "DO", "DOV", "DQ", "DC", "DCV", "DX",
+    "W", "WN", "WNC", "WC", "WO", "AeBe"
+]
+
+# GGG heuristic: PlanetClass values flagged as potential Green Gas Giant candidates.
+ggg_planet_classes = [
+    "Sudarsky class I gas giant",
+    "Sudarsky class II gas giant",
+    "Sudarsky class III gas giant",
+    "Sudarsky class IV gas giant",
+    "Sudarsky class V gas giant",
+    "Helium-rich gas giant",
+    "Helium gas giant"
+]
+
+# NSP rule: FSSSignalDiscovered SignalType values to treat as mundane (not flagged).
+# NSP detection now uses CodexEntry (NearestDestination = "$Fixed_Event_*") which
+# captures named entities (Gyre Trees, Lagrange Clouds, etc.) with full context.
+# This list is a secondary filter for any non-CodexEntry Codex-type FSS signals.
+nsp_mundane_signal_types = [
+    "Fleet Carrier",
+    "Station",
+    "Outpost",
+    "Installation",
+    "Nav Beacon",
+    "Resource Extraction Site",
+    "Combat Zone",
+    "Combat Zone (Low)",
+    "Combat Zone (Medium)",
+    "Combat Zone (High)",
+    "Unidentified Signal Source",
+    "Mission target",
+    "Megaship"
+]

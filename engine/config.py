@@ -25,6 +25,7 @@ def load(config_path: Path) -> dict:
 
     with open(config_path, "rb") as fh:
         raw = tomllib.load(fh)
+    raw["config_path"] = Path(config_path).resolve()
 
     # ── Paths ──────────────────────────────────────────────────────────────────
     raw["journal_dir"] = _expand(raw["journal_dir"], root)

@@ -9,8 +9,14 @@ Entry point.  Run via:
   python     tracker.pyw --survey-rebuild  # replay stored events into the survey CSV
   python     tracker.pyw --survey-resolve "<system>" [...] [--as not_found]
   python     tracker.pyw --close-leg "<name>"     # close the open leg + export
+  python     tracker.pyw --configure  # open the configuration window
 
 Pass --config <file.toml> to run a different expedition (e.g. a sector survey).
+
+The installed build runs the same modes: EDLedger.exe (tray, --configure) and
+EDLedger-cli.exe (console, for the commands above).  It keeps its config in
+%APPDATA%/EDLedger and its database, log and exports in %LOCALAPPDATA%/EDLedger
+(see engine/paths.py); a source run keeps them in this folder.
 
 The .pyw extension means Windows will use pythonw.exe by default when
 double-clicked (no console window).
@@ -33,19 +39,24 @@ from typing import Any
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+from engine import paths, __version__
+
 # ── Logging setup ──────────────────────────────────────────────────────────────
 
 def _setup_logging(verbose: bool = False, to_console: bool = False) -> None:
     level   = logging.DEBUG if verbose else logging.INFO
     fmt     = "%(asctime)s  %(levelname)-8s  %(name)s -- %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
+    log_dir = paths.data_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
         logging.handlers.RotatingFileHandler(
-            ROOT / "tracker.log", maxBytes=5 * 1024 * 1024,
+            log_dir / "tracker.log", maxBytes=5 * 1024 * 1024,
             backupCount=3, encoding="utf-8",
         )
     ]
-    if to_console:
+    # The windowed exe has no console (sys.stdout is None).
+    if to_console and sys.stdout is not None:
         # Windows consoles default to cp1252; don't crash on "→" in log lines.
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(errors="replace")
@@ -568,9 +579,28 @@ def _run_reset(cfg: dict, config_path: Path) -> None:
     print("then launch tracker.pyw to start fresh.")
 
 
+def _show_error(title: str, message: str) -> None:
+    """Error dialog for the windowed app, which has no console to print to."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _run_configure(config_path: Path, first_run: bool = False) -> bool:
+    """Open the configuration window; True if the config was saved."""
+    from ui.config_window import ConfigWindow
+    return ConfigWindow(config_path, first_run=first_run).run()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Elite Dangerous Expedition Tracker"
+        description=f"ED Expedition Ledger {__version__}"
     )
     ap.add_argument("--cli",      action="store_true", help="Run headless (console/log output)")
     ap.add_argument("--validate", action="store_true", help="Assert invariants + check baseline")
@@ -585,16 +615,43 @@ def main() -> None:
                          "done_by_other, or clear")
     ap.add_argument("--close-leg", metavar="NAME",
                     help="Close the open leg under NAME, open the next, export it")
-    ap.add_argument("--config",   default=str(ROOT / "config.toml"), help="Path to config.toml")
+    ap.add_argument("--configure", action="store_true", help="Open the configuration window")
+    ap.add_argument("--config",   default=str(paths.default_config_path()),
+                    help="Path to the expedition config (.toml)")
     ap.add_argument("--verbose",  action="store_true", help="Debug-level logging")
+    ap.add_argument("--version",  action="version", version=f"ED Expedition Ledger {__version__}")
     args = ap.parse_args()
 
-    to_console = (args.cli or args.validate or args.snapshot or args.reset
-                  or args.survey_rebuild or args.survey_resolve or args.close_leg)
+    to_console = bool(args.cli or args.validate or args.snapshot or args.reset
+                      or args.survey_rebuild or args.survey_resolve or args.close_leg)
     _setup_logging(verbose=args.verbose, to_console=to_console)
+    config_path = Path(args.config)
+
+    if args.configure:
+        _run_configure(config_path)
+        return
+
+    # First run (no config yet): set up the expedition before starting the tray.
+    if not config_path.exists():
+        if to_console:
+            print(f"No config at {config_path}. Run with --configure first.")
+            sys.exit(1)
+        if not _run_configure(config_path, first_run=True):
+            return
 
     from engine.config import load as load_cfg
-    cfg = load_cfg(Path(args.config))
+    try:
+        cfg = load_cfg(config_path)
+    except Exception as exc:
+        logging.getLogger("main").exception("Could not load %s", config_path)
+        if to_console:
+            print(f"Could not load {config_path}: {exc}")
+            sys.exit(1)
+        _show_error("ED Expedition Ledger",
+                    f"Could not load the expedition config:\n{config_path}\n\n{exc}\n\n"
+                    "The configuration window will open so you can fix it.")
+        _run_configure(config_path)
+        return
 
     if args.reset:
         _run_reset(cfg, Path(args.config))
