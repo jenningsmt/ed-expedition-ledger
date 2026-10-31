@@ -15,10 +15,13 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .db import Database
 from .legs import LegManager
+
+if TYPE_CHECKING:
+    from .survey import SurveyTracker
 
 log = logging.getLogger(__name__)
 
@@ -51,29 +54,45 @@ class EventParser:
         legs: LegManager,
         cfg: dict,
         on_leg_close: "Callable[[int], None] | None" = None,
+        survey: "SurveyTracker | None" = None,
+        on_session_end: "Callable[[], None] | None" = None,
     ) -> None:
         self.db = db
         self.legs = legs
         self._cutoff: datetime = cfg["expedition_start_dt"]
-        self._commander: str = cfg["commander"].lower().strip()
+        self._commanders: set[str] = {
+            c.lower().strip() for c in (cfg.get("commanders") or [cfg["commander"]])
+        }
         self._on_leg_close = on_leg_close  # callback for tray/CLI notifications
+        self._survey = survey
+        # Fired on the game's Shutdown event, but only once `live` is set
+        # (after backfill) so replaying old journals doesn't trigger it.
+        self._on_session_end = on_session_end
+        self.live = False
 
         # Current system is maintained across calls so we can fill from_system
         # on FSDJump events (the event itself only carries the destination).
         # Restored from the DB on startup via restore_state().
         self._current_system: str | None = None
 
-        # Commander seen in the most recent LoadGame event.  None until the first
-        # LoadGame is processed (e.g. mid-file Continued journals).  Events from
-        # a different commander are dropped so a second account sharing the same
-        # journal directory cannot pollute the expedition data.
+        # Commander seen in the most recent Commander / LoadGame event.  None
+        # until the first one is processed (e.g. mid-file Continued journals).
+        # Events from commanders not in the configured list are dropped so other
+        # accounts sharing the journal directory cannot pollute the data.
+        # _session_commander is normalised; _session_commander_name keeps the
+        # journal's casing for display (survey "completed", Commander columns).
         self._session_commander: str | None = None
+        self._session_commander_name: str | None = None
 
     def restore_state(self) -> None:
         """Restore in-memory state from the DB after a restart."""
         last = self.db.get_last_jump()
         self._current_system = last["to_system"] if last else None
-        log.debug("Parser state restored: current_system=%s", self._current_system)
+        name = self.db.get_last_session_commander()
+        if name:
+            self._set_session_commander(name)
+        log.debug("Parser state restored: current_system=%s commander=%s",
+                  self._current_system, self._session_commander_name)
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -114,15 +133,20 @@ class EventParser:
         if not self.db.insert_event(dedupe_key, ts_str, event_type, line):
             return False  # Already processed
 
+        # ── Session commander ──────────────────────────────────────────────────
+        if event_type == "Commander":
+            self._set_session_commander(ev.get("Name", ""))
+        elif event_type == "LoadGame":
+            self._set_session_commander(ev.get("Commander", ""))
+
         # ── Commander gate ─────────────────────────────────────────────────────
-        # LoadGame always passes so we can update _session_commander.
-        # All other events are dropped when the active session belongs to a
-        # different commander (second account in the same journal folder).
-        if event_type != "LoadGame" and self._session_commander is not None:
-            if self._session_commander != self._commander:
+        # Events are dropped when the active session belongs to a commander
+        # not in the configured list (other accounts in the same journal folder).
+        if self._session_commander is not None:
+            if self._session_commander not in self._commanders:
                 log.debug(
-                    "Skipping %s: session commander %r != configured %r",
-                    event_type, self._session_commander, self._commander,
+                    "Skipping %s: session commander %r not in %r",
+                    event_type, self._session_commander, self._commanders,
                 )
                 return False
 
@@ -134,9 +158,39 @@ class EventParser:
             except Exception:
                 log.exception("Error handling %s event at %s", event_type, ts_str)
 
+        # ── Sector survey ──────────────────────────────────────────────────────
+        # After dispatch, so the FSDJump handler's region-complete check sees
+        # the survey as it stood before this jump (close on the jump *away*).
+        if self._survey is not None:
+            try:
+                self._survey.on_event(ev, self._session_commander_name)
+            except Exception:
+                log.exception("Survey error handling %s event at %s", event_type, ts_str)
+
         return True
 
     # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _close_completed_regions(self, from_system: str, ts: str) -> None:
+        """Departure check for clustered survey files: close a leg for any
+        claimed survey region that is complete but not yet closed."""
+        if self._survey is None or not self._survey.regions:
+            return
+        complete = self._survey.complete_regions()
+        closed   = self.db.get_visited_waypoints()
+        pending  = [r for r in complete if r not in closed]
+        if not pending:
+            return
+        all_done = len(complete) == len(self._survey.regions)
+        result = self.legs.on_regions_complete(pending, from_system, ts, all_done)
+        closed_id = result["leg_id_closed"]
+        if self._on_leg_close and closed_id is not None:
+            self._on_leg_close(closed_id)
+
+    def _set_session_commander(self, name: str) -> None:
+        self._session_commander_name = name.strip() or None
+        self._session_commander = name.lower().strip() or None
+        log.debug("Session commander set to %r", self._session_commander_name)
 
     def _active_leg_id(self) -> int | None:
         leg = self.db.get_active_leg()
@@ -153,9 +207,9 @@ class EventParser:
 
     # ── Event handlers ─────────────────────────────────────────────────────────
 
-    def _on_LoadGame(self, ev: dict, ts: str) -> None:
-        self._session_commander = ev.get("Commander", "").lower().strip()
-        log.debug("Session commander set to %r", self._session_commander)
+    def _on_Shutdown(self, ev: dict, ts: str) -> None:
+        if self.live and self._on_session_end:
+            self._on_session_end()
 
     def _on_FSDJump(self, ev: dict, ts: str) -> None:
         to_sys = ev.get("StarSystem", "")
@@ -171,6 +225,7 @@ class EventParser:
                 closed_id = result["leg_id_closed"]
                 if self._on_leg_close and closed_id is not None:
                     self._on_leg_close(closed_id)
+            self._close_completed_regions(self._current_system, ts)
 
         # leg_id is now the active leg — either unchanged or the freshly opened one.
         leg_id = self._active_leg_id()
@@ -189,6 +244,7 @@ class EventParser:
             star_pos=ev.get("StarPos", []),
             visit_ts=ts,
             leg_id=leg_id,
+            commander=self._session_commander_name,
         )
         self._arrive(to_sys, ts)
 
@@ -218,6 +274,7 @@ class EventParser:
             star_pos=ev.get("StarPos", []),
             visit_ts=ts,
             leg_id=leg_id,
+            commander=self._session_commander_name,
         )
         self._arrive(sys_name, ts)
 
@@ -264,6 +321,7 @@ class EventParser:
             was_discovered=bool(ev.get("WasDiscovered", True)),
             was_mapped=bool(ev.get("WasMapped", True)),
             leg_id=self._active_leg_id(),
+            commander=self._session_commander_name,
         )
 
     def _on_ScanBaryCentre(self, ev: dict, ts: str) -> None:
@@ -278,7 +336,7 @@ class EventParser:
             ts=ts, system=system, body_name=body_name, body_id=body_id,
             body_class="Barycentre", terraform_state=None, landable=False,
             distance_ls=None, was_discovered=True, was_mapped=True,
-            leg_id=self._active_leg_id(),
+            leg_id=self._active_leg_id(), commander=self._session_commander_name,
         )
 
     def _on_SAAScanComplete(self, ev: dict, ts: str) -> None:

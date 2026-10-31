@@ -24,13 +24,20 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 from .db import Database
+
+if TYPE_CHECKING:
+    from .survey import SurveyTracker
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +87,24 @@ def _leg_slug(leg) -> str:
     return f"Leg{leg['ordinal']:02d}_{name}_{date}"
 
 
+def sector_slug(sector: str, as_of: str, leg_name: "str | None" = None) -> str:
+    """File stem for a sector-survey export.
+
+    Open leg (as-of):  sector_hypiae_aim_2026-10-23
+    Closed leg:        hypiae_aim_R14_2026-10-25          (region "R14")
+                       hypiae_aim_R01_R02_2026-10-25      ("R01 + R02")
+                       hypiae_aim_pre-regions_2026-10-24  ("Hypiae Aim (pre-regions)")
+    """
+    sector_part = sector.lower().strip().replace(" ", "_")
+    if not leg_name:
+        return f"sector_{sector_part}_{as_of}"
+    name = leg_name.strip()
+    if name.lower().startswith(sector.lower().strip()):
+        name = name[len(sector.strip()):]          # don't repeat the sector
+    name = re.sub(r"[^A-Za-z0-9-]+", "_", name).strip("_") or "leg"
+    return f"{sector_part}_{name}_{as_of}"
+
+
 def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
     ws = wb.create_sheet(name)
     ws.append(headers)
@@ -95,24 +120,68 @@ def _add_sheet(wb, name: str, headers: list[str], rows: list[list]) -> None:
 # ── Main entry points ──────────────────────────────────────────────────────────
 
 def export_leg(leg_id: int, db: Database, output_dir: Path,
-               suffix: str = "") -> Path:
+               suffix: str = "", waypoint_systems: "set[str] | None" = None,
+               slug: "str | None" = None, as_of: "str | None" = None,
+               extra_sheets: "list[tuple[str, str, list[str], list[list]]] | None" = None,
+               system_role: "Callable[[str], dict] | None" = None,
+               ) -> Path:
     """Export one leg to xlsx + CSVs.  Returns the xlsx path.
 
     Pass suffix (e.g. '_snapshot_20260603T014500') to distinguish an
     on-demand snapshot from the final waypoint-close export.
+
+    Pass slug to override the file stem entirely (sector mode), and as_of
+    to add an "As of (UTC)" row to the Summary sheet.  extra_sheets is a list
+    of (sheet name, csv suffix, headers, rows) appended after the standard
+    sheets, each also written as <slug>_<csv suffix>.csv.  system_role
+    (SurveyTracker.system_role) adds Survey Role / Region / Visit Order
+    columns to Systems and survey counts to the Summary.
+
+    Pass waypoint_systems (normalised/lowercased system names, from
+    cfg["waypoint_map"] when config.toml's waypoints_only_export is true) to
+    restrict Systems/Bodies/Terraformable/Body Classes/Organics/Codex/Rare
+    Finds to just those systems, excluding everything transited in between.
+    Sales stay whole-leg regardless -- FDev's own sale events don't record
+    per-system earnings, so they can't be split the same way (see the Sales
+    sheet note below).
     """
     leg = db.get_leg(leg_id)
     if leg is None:
         raise ValueError(f"Leg {leg_id} not found in DB.")
 
-    slug   = _leg_slug(leg) + suffix
+    slug   = slug or (_leg_slug(leg) + suffix)
     xlsx_p = output_dir / f"{slug}.xlsx"
     wb     = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    stats     = db.stats_for_leg(leg_id)          # DISTINCT counts
-    class_bkd = db.get_body_class_breakdown(leg_id)
-    rf_stats  = db.get_rare_finds_stats(leg_id)
+    stats     = db.stats_for_leg(leg_id, waypoint_systems)          # DISTINCT counts
+    class_bkd = db.get_body_class_breakdown(leg_id, waypoint_systems)
+    rf_stats  = db.get_rare_finds_stats(leg_id, waypoint_systems)
+
+    # Systems first: the Summary counts survey roles from them.
+    sys_headers = [
+        "System", "First Visit (UTC)", "Body Count", "Fully Scanned",
+        "Star Pos X", "Star Pos Y", "Star Pos Z", "Commander", "Discovery",
+    ]
+    if system_role:
+        sys_headers += ["Survey Role", "Survey Region", "Visit Order"]
+    sys_rows = []
+    role_counts: dict[tuple[str, str], int] = {}
+    for s in db.get_systems_for_leg(leg_id, waypoint_systems):
+        disc = s["arrival_was_discovered"]
+        discovery = "" if disc is None else ("previously discovered" if disc else "new")
+        row = [
+            s["system_name"], s["first_visit_ts"], s["body_count"],
+            "Yes" if s["fully_scanned"] else "No",
+            s["star_pos_x"], s["star_pos_y"], s["star_pos_z"], s["commander"] or "",
+            discovery,
+        ]
+        if system_role:
+            info = system_role(s["system_name"])
+            row += [info["role"], info["survey_region"], info["visit_order"]]
+            key = (info["role"], discovery)
+            role_counts[key] = role_counts.get(key, 0) + 1
+        sys_rows.append(row)
 
     # ── Summary sheet ──────────────────────────────────────────────────────────
     ws = wb.create_sheet("Summary")
@@ -123,6 +192,19 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         ("Start time (UTC)",     leg["start_ts"] or "—"),
         ("End system",           leg["end_system"] or "—"),
         ("End time (UTC)",       leg["end_ts"] or "—"),
+    ]
+    if as_of:
+        summary_rows.append(("As of (UTC)", as_of))
+    if waypoint_systems:
+        summary_rows.append((
+            "Note",
+            f"waypoints_only_export is ON — Systems/Bodies/Terraformable/Body Classes/"
+            f"Organics/Codex/Rare Finds below cover only this leg's {len(waypoint_systems)} "
+            f"configured waypoint system(s), not systems transited in between. Sales "
+            f"totals are NOT filterable this way (FDev's sale events don't record "
+            f"per-system earnings) and cover the whole leg.",
+        ))
+    summary_rows += [
         ("", ""),
         ("— Journey ——————————", ""),
         ("Commander jumps",      stats["commander_jumps"]),
@@ -155,6 +237,22 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         ("— Rare / notable finds ————————", ""),
         ("Rare finds (first discoveries)", rf_stats["rare_finds_count"]),
     ]
+    if system_role:
+        def count(role: str, discovery: "str | None" = None) -> int:
+            return sum(n for (r, d), n in role_counts.items()
+                       if r == role and (discovery is None or d == discovery))
+        summary_rows += [
+            ("", ""),
+            ("— Survey (systems first visited this leg) ——", ""),
+            ("Targets visited",                 count("target")),
+            ("  new discoveries",               count("target", "new")),
+            ("  previously discovered",         count("target", "previously discovered")),
+            ("Other-region candidates visited", count("other-region candidate")),
+            ("Serendipitous (new, in sector)",  count("serendipitous")),
+            ("Transit systems",                 count("transit")),
+            ("  new discoveries",               count("transit", "new")),
+            ("  previously discovered",         count("transit", "previously discovered")),
+        ]
     rf_bkd = rf_stats["rare_finds_by_rule"]
     for rule_tag, cnt in sorted(rf_bkd.items()):
         summary_rows.append((f"  {rule_tag}", cnt))
@@ -166,17 +264,6 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     ws.column_dimensions["B"].width = 22
 
     # ── Systems sheet ──────────────────────────────────────────────────────────
-    sys_headers = [
-        "System", "First Visit (UTC)", "Body Count", "Fully Scanned",
-        "Star Pos X", "Star Pos Y", "Star Pos Z",
-    ]
-    sys_rows = []
-    for s in db.get_systems_for_leg(leg_id):
-        sys_rows.append([
-            s["system_name"], s["first_visit_ts"], s["body_count"],
-            "Yes" if s["fully_scanned"] else "No",
-            s["star_pos_x"], s["star_pos_y"], s["star_pos_z"],
-        ])
     _add_sheet(wb, "Systems", sys_headers, sys_rows)
     _write_csv(output_dir / f"{slug}_systems.csv", sys_headers, sys_rows)
 
@@ -184,9 +271,10 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     body_headers = [
         "System", "Body Name", "Body ID", "Class", "Terraform State",
         "Landable", "Dist LS", "First Discovery", "Pre-Mapped", "Surface Mapped",
+        "Commander",
     ]
     body_rows = []
-    for b in db.get_bodies_for_leg(leg_id):
+    for b in db.get_bodies_for_leg(leg_id, waypoint_systems):
         body_rows.append([
             b["system"], b["body_name"], b["body_id"], b["body_class"],
             b["terraform_state"],
@@ -195,6 +283,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
             "Yes" if not b["was_discovered"] else "No",
             "Yes" if not b["was_mapped"] else "No",
             "Yes" if b["surface_mapped"] else "No",
+            b["commander"] or "",
         ])
     _add_sheet(wb, "Bodies", body_headers, body_rows)
     _write_csv(output_dir / f"{slug}_bodies.csv", body_headers, body_rows)
@@ -207,7 +296,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         "First Discovery", "Surface Mapped", "Landable",
     ]
     terra_rows = []
-    for b in db.get_bodies_for_leg(leg_id):
+    for b in db.get_bodies_for_leg(leg_id, waypoint_systems):
         is_terra = bool(b["terraform_state"] and b["terraform_state"].strip())
         is_high_value = b["body_class"] in _HIGH_VALUE_CLASSES
         if is_terra or is_high_value:
@@ -234,7 +323,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     # ── Organics sheet ─────────────────────────────────────────────────────────
     org_headers = ["System", "Body ID", "Genus", "Species", "Variant"]
     org_rows = []
-    for o in db.get_organics_for_leg(leg_id):
+    for o in db.get_organics_for_leg(leg_id, waypoint_systems):
         org_rows.append([o["system"], o["body_id"], o["genus"], o["species"], o["variant"]])
     _add_sheet(wb, "Organics", org_headers, org_rows)
     _write_csv(output_dir / f"{slug}_organics.csv", org_headers, org_rows)
@@ -242,7 +331,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     # ── Codex sheet ────────────────────────────────────────────────────────────
     codex_headers = ["Timestamp", "Name", "Region", "System"]
     codex_rows = [[c["ts"], c["name"], c["region"], c["system"]]
-                  for c in db.get_codex_for_leg(leg_id)]
+                  for c in db.get_codex_for_leg(leg_id, waypoint_systems)]
     _add_sheet(wb, "Codex Firsts", codex_headers, codex_rows)
     _write_csv(output_dir / f"{slug}_codex.csv", codex_headers, codex_rows)
 
@@ -252,7 +341,7 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
         "Dist LS", "First Discovery", "Pre-Mapped", "Footfalled",
     ]
     rf_rows = []
-    for rf in db.get_rare_finds_for_leg(leg_id):
+    for rf in db.get_rare_finds_for_leg(leg_id, waypoint_systems):
         try:
             rules = ", ".join(json.loads(rf["matched_rules"]))
             dets  = "; ".join(
@@ -285,13 +374,23 @@ def export_leg(leg_id: int, db: Database, output_dir: Path,
     _add_sheet(wb, "Sales", sales_headers, sales_rows)
     _write_csv(output_dir / f"{slug}_sales.csv", sales_headers, sales_rows)
 
+    for sheet_name, csv_suffix, headers, rows in extra_sheets or []:
+        _add_sheet(wb, sheet_name, headers, rows)
+        _write_csv(output_dir / f"{slug}_{csv_suffix}.csv", headers, rows)
+
     wb.save(str(xlsx_p))
     log.info("Exported leg %d -> %s", leg_id, xlsx_p.name)
     return xlsx_p
 
 
-def export_master_rollup(db: Database, output_dir: Path) -> Path:
-    """Build/overwrite the master rollup workbook."""
+def export_master_rollup(
+    db: Database, output_dir: Path, waypoint_systems: "set[str] | None" = None,
+) -> Path:
+    """Build/overwrite the master rollup workbook.
+
+    See export_leg() for what waypoint_systems restricts (and what it
+    doesn't -- sales stay whole-leg/whole-expedition regardless).
+    """
     xlsx_p = output_dir / "master_rollup.xlsx"
     wb     = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -309,13 +408,13 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
     ws.append(headers)
     _style_header(ws)
 
-    grand     = db.stats_for_leg(None)
-    grand_bkd = db.get_body_class_breakdown(None)
-    grand_rf  = db.get_rare_finds_stats(None)
+    grand     = db.stats_for_leg(None, waypoint_systems)
+    grand_bkd = db.get_body_class_breakdown(None, waypoint_systems)
+    grand_rf  = db.get_rare_finds_stats(None, waypoint_systems)
 
     for leg in all_legs:
-        s  = db.stats_for_leg(leg["leg_id"])
-        rf = db.get_rare_finds_stats(leg["leg_id"])
+        s  = db.stats_for_leg(leg["leg_id"], waypoint_systems)
+        rf = db.get_rare_finds_stats(leg["leg_id"], waypoint_systems)
         ws.append([
             leg["ordinal"],
             leg["name"] or "—",
@@ -352,7 +451,16 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
 
     # ── Whole-expedition summary ───────────────────────────────────────────────
     ws2 = wb.create_sheet("Expedition Summary")
-    summ = [
+    summ: list[tuple] = []
+    if waypoint_systems:
+        summ.append((
+            "Note",
+            f"waypoints_only_export is ON — per-system figures below cover only the "
+            f"{len(waypoint_systems)} configured waypoint system(s); Carto/Exo-Bio "
+            f"sales are whole-expedition (not filterable per system).",
+        ))
+        summ.append(("", ""))
+    summ += [
         ("Commander jumps",     grand["commander_jumps"]),
         ("Total distance (LY)", f"{grand['distance_ly']:.2f}"),
         ("Carrier jumps",       grand["carrier_jumps"]),
@@ -410,7 +518,7 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
     ]
     all_rf_rows = []
     for leg in all_legs:
-        for rf in db.get_rare_finds_for_leg(leg["leg_id"]):
+        for rf in db.get_rare_finds_for_leg(leg["leg_id"], waypoint_systems):
             try:
                 rules = ", ".join(json.loads(rf["matched_rules"]))
                 dets  = "; ".join(
@@ -435,4 +543,49 @@ def export_master_rollup(db: Database, output_dir: Path) -> Path:
 
     wb.save(str(xlsx_p))
     log.info("Master rollup written -> %s", xlsx_p.name)
+    return xlsx_p
+
+
+def export_for_config(cfg: dict, db: Database, leg_id: int, suffix: str = "",
+                      survey: "SurveyTracker | None" = None) -> Path:
+    """Run the rarity pass, then export one leg + the master rollup using the
+    naming and filter rules from cfg.  Returns the leg xlsx path.
+
+    Waypoint mode: Leg##_<name>_<start date><suffix>.
+    Sector mode:   open leg → sector_<sector>_<as-of date>, so re-exporting on
+                   the same UTC day overwrites that day's files;
+                   closed leg → <sector>_<leg name>_<close date> (e.g.
+                   hypiae_aim_R14_2026-10-25), plus a copy of the master
+                   rollup as of that close, <stem>_master_rollup.xlsx.
+    A closed survey-region leg ("R01", "R01 + R02") also gets a Candidates
+    sheet listing that region's rows from the survey CSV.
+    """
+    from .rarity import run_rarity_pass
+    run_rarity_pass(db, cfg.get("rarity", {}))
+
+    out = Path(cfg["output_dir"])
+    wp  = set(cfg["waypoint_map"]) if cfg.get("waypoints_only_export", False) else None
+    if cfg.get("mode") == "sector":
+        leg = db.get_leg(leg_id)
+        extra = []
+        if survey is not None and leg["name"]:
+            regions = [r for r in leg["name"].split(" + ") if r in survey.regions]
+            if regions:
+                headers, rows = survey.region_rows(regions)
+                extra.append(("Candidates", "candidates", headers, rows))
+        if leg["end_ts"]:
+            slug  = sector_slug(cfg["sector"], leg["end_ts"][:10], leg["name"] or f"leg{leg['ordinal']:02d}")
+            as_of = None
+        else:
+            as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            slug  = sector_slug(cfg["sector"], as_of)
+        xlsx_p = export_leg(leg_id, db, out, waypoint_systems=wp,
+                            slug=slug, as_of=as_of, extra_sheets=extra,
+                            system_role=survey.system_role if survey else None)
+    else:
+        xlsx_p = export_leg(leg_id, db, out, suffix=suffix, waypoint_systems=wp)
+    rollup = export_master_rollup(db, out, waypoint_systems=wp)
+    if cfg.get("mode") == "sector" and leg["end_ts"]:
+        # The live master_rollup.xlsx keeps changing; keep it as of this close.
+        shutil.copy2(rollup, out / f"{slug}_master_rollup.xlsx")
     return xlsx_p

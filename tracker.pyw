@@ -6,6 +6,17 @@ Entry point.  Run via:
   python     tracker.pyw --cli       # headless / console mode
   python     tracker.pyw --validate  # invariants + baseline comparison
   python     tracker.pyw --snapshot  # regenerate validation_baseline.json
+  python     tracker.pyw --survey-rebuild  # replay stored events into the survey CSV
+  python     tracker.pyw --survey-resolve "<system>" [...] [--as not_found]
+  python     tracker.pyw --close-leg "<name>"     # close the open leg + export
+  python     tracker.pyw --configure  # open the configuration window
+
+Pass --config <file.toml> to run a different expedition (e.g. a sector survey).
+
+The installed build runs the same modes: EDLedger.exe (tray, --configure) and
+EDLedger-cli.exe (console, for the commands above).  It keeps its config in
+%APPDATA%/EDLedger and its database, log and exports in %LOCALAPPDATA%/EDLedger
+(see engine/paths.py); a source run keeps them in this folder.
 
 The .pyw extension means Windows will use pythonw.exe by default when
 double-clicked (no console window).
@@ -28,7 +39,7 @@ from typing import Any
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-BASELINE_PATH = ROOT / "validation_baseline.json"
+from engine import paths, __version__
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 
@@ -36,13 +47,19 @@ def _setup_logging(verbose: bool = False, to_console: bool = False) -> None:
     level   = logging.DEBUG if verbose else logging.INFO
     fmt     = "%(asctime)s  %(levelname)-8s  %(name)s -- %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
+    log_dir = paths.data_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
         logging.handlers.RotatingFileHandler(
-            ROOT / "tracker.log", maxBytes=5 * 1024 * 1024,
+            log_dir / "tracker.log", maxBytes=5 * 1024 * 1024,
             backupCount=3, encoding="utf-8",
         )
     ]
-    if to_console:
+    # The windowed exe has no console (sys.stdout is None).
+    if to_console and sys.stdout is not None:
+        # Windows consoles default to cp1252; don't crash on "→" in log lines.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
 
@@ -132,29 +149,45 @@ def _run_cli(cfg: dict) -> None:
     from engine.legs     import LegManager
     from engine.parser   import EventParser
     from engine.watcher  import JournalWatcher
-    from engine.exporter import export_leg, export_master_rollup
+    from engine.exporter import export_for_config
+    from engine.survey   import make_survey
 
     log = logging.getLogger("cli")
     db  = Database(cfg["db_path"])
+    sector_mode = cfg.get("mode") == "sector"
 
     legs   = LegManager(db, cfg)
     legs.ensure_first_leg()
 
-    def on_leg_close(leg_id: int) -> None:
-        from engine.rarity import run_rarity_pass
-        log.info("Leg %d closed -- running rarity pass ...", leg_id)
-        run_rarity_pass(db, cfg.get("rarity", {}))
-        log.info("Leg %d -- exporting ...", leg_id)
-        export_leg(leg_id, db, cfg["output_dir"])
-        export_master_rollup(db, cfg["output_dir"])
+    survey = make_survey(cfg, on_write_blocked=log.warning)
+    if survey:
+        survey.autoflush = False
 
-    parser  = EventParser(db, legs, cfg, on_leg_close=on_leg_close)
+    def on_leg_close(leg_id: int) -> None:
+        log.info("Leg %d closed -- exporting ...", leg_id)
+        export_for_config(cfg, db, leg_id, survey=survey)
+
+    def export_active() -> None:
+        leg = db.get_active_leg()
+        if leg is not None:
+            log.info("Exporting %s ...", leg["name"] or f"Leg {leg['ordinal']}")
+            export_for_config(cfg, db, leg["leg_id"], survey=survey)
+
+    parser  = EventParser(db, legs, cfg, on_leg_close=on_leg_close, survey=survey,
+                          on_session_end=export_active if sector_mode else None)
     parser.restore_state()
     watcher = JournalWatcher(Path(cfg["journal_dir"]), db, parser)
 
     log.info("Starting backfill from %s ...", cfg["journal_dir"])
     n = watcher.backfill()
     log.info("Backfill done (%d new events).  Status: %s", n, legs.status_text())
+    if survey:
+        survey.autoflush = True
+        survey.flush()
+        log.info(survey.summary_text())
+    parser.live = True
+    if sector_mode:
+        export_active()
 
     watcher.start()
     log.info("Live-tailing journals.  Press Ctrl-C to stop.")
@@ -170,6 +203,10 @@ def _run_cli(cfg: dict) -> None:
             time.sleep(1)
     finally:
         watcher.stop()
+        if survey:
+            survey.close()
+        if sector_mode:
+            export_active()
         db.close()
         log.info("CLI session ended.")
 
@@ -198,10 +235,11 @@ def _run_snapshot(cfg: dict) -> None:
         "cutoff":       cfg["expedition_start_timestamp"],
         "metrics":      stats,
     }
-    BASELINE_PATH.write_text(
+    baseline_path = Path(cfg["baseline_path"])
+    baseline_path.write_text(
         json.dumps(baseline, indent=2, sort_keys=True), encoding="utf-8"
     )
-    print(f"Snapshot written to {BASELINE_PATH}")
+    print(f"Snapshot written to {baseline_path}")
     print()
     print("Metrics captured:")
     for k, v in sorted(stats.items()):
@@ -239,18 +277,19 @@ def _run_validate(cfg: dict) -> None:
         # ── Baseline comparison ────────────────────────────────────────────────
         print()
         print("=== Baseline Comparison ===")
-        if not BASELINE_PATH.exists():
-            print(f"  No baseline found at {BASELINE_PATH}.")
+        baseline_path = Path(cfg["baseline_path"])
+        if not baseline_path.exists():
+            print(f"  No baseline found at {baseline_path}.")
             print("  Run  python tracker.pyw --snapshot  to create one.")
             print("  (Only invariant results above count for this run.)")
         else:
-            bl_failures = _check_baseline(stats, BASELINE_PATH)
+            bl_failures = _check_baseline(stats, baseline_path)
             if bl_failures:
                 for line in bl_failures:
                     print(f"  {line}")
                 exit_code = 1
             else:
-                baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+                baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
                 n = len(baseline["metrics"])
                 print(f"  All {n} metrics meet or exceed baseline "
                       f"(generated {baseline['generated_at']}).")
@@ -395,19 +434,122 @@ def _check_baseline(current: dict, path: Path) -> list[str]:
     return failures
 
 
+# ── Survey rebuild ─────────────────────────────────────────────────────────────
+
+def _run_survey_rebuild(cfg: dict) -> None:
+    """Replay every survey-relevant event stored in the DB into the survey CSV.
+
+    Use after replacing the CSV with a fresh sector-surveyor output: progress
+    already flown is re-applied.  Existing non-empty cells are kept.
+    Stop the tracker first so the two don't write the CSV at the same time.
+    """
+    from engine.db     import Database
+    from engine.survey import make_survey, replay_events
+
+    survey = make_survey(cfg)
+    if survey is None:
+        print("No [survey] csv_path in this config -- nothing to rebuild.")
+        sys.exit(1)
+    if not Path(cfg["db_path"]).exists():
+        print(f"No database at {cfg['db_path']} -- run the tracker once first.")
+        sys.exit(1)
+
+    db = Database(cfg["db_path"])
+    events = db.get_events_raw_ordered((
+        "Commander", "LoadGame", "FSDJump", "Location", "CarrierJump",
+        "Scan", "FSSAllBodiesFound", "CodexEntry",
+    ))
+    db.close()
+
+    replay_events(survey, events)
+    if survey.flush():
+        print(f"Replayed {len(events):,} events into {survey.path}")
+        print(survey.summary_text())
+    else:
+        print(f"Could not write {survey.path} -- is it open in Excel?")
+        sys.exit(1)
+
+
+def _run_survey_resolve(cfg: dict, systems: "list[str]", value: str) -> None:
+    """Set the resolution column for systems in a clustered survey CSV.
+
+    Safe while the tracker is running: it merges edits made to the file
+    before its next write, and the resolution column always takes the value
+    on disk.  value "clear" empties the cell.
+    """
+    from engine.survey import SurveyFormatError, make_survey
+
+    survey = make_survey(cfg)
+    if survey is None:
+        print("No [survey] csv_path in this config.")
+        sys.exit(1)
+    value = "" if value.lower() == "clear" else value
+    unknown = []
+    try:
+        for name in systems:
+            if not survey.resolve(name, value):
+                unknown.append(name)
+    except SurveyFormatError as exc:
+        print(exc)
+        sys.exit(1)
+    if not survey.flush():
+        print(f"Could not write {survey.path} -- is it open in Excel?")
+        sys.exit(1)
+    done = len(systems) - len(unknown)
+    print(f"{done} system(s) set to {value or '(cleared)'!r} in {survey.path.name}")
+    for name in unknown:
+        print(f"  not in the candidate file: {name}")
+    print(survey.summary_text())
+    if unknown:
+        sys.exit(1)
+
+
+# ── Manual leg close ───────────────────────────────────────────────────────────
+
+def _run_close_leg(cfg: dict, name: str) -> None:
+    """Close the open leg under the given name, open the next, and export
+    the closed leg.  Stop the tracker first."""
+    from engine.db       import Database
+    from engine.exporter import export_for_config
+    from engine.legs     import LegManager
+    from engine.survey   import make_survey
+
+    if not Path(cfg["db_path"]).exists():
+        print(f"No database at {cfg['db_path']} -- nothing to close.")
+        sys.exit(1)
+    db = Database(cfg["db_path"])
+    try:
+        legs = LegManager(db, cfg)
+        leg = db.get_active_leg()
+        if leg is None:
+            print("No open leg to close.")
+            sys.exit(1)
+        closed_id = legs.manual_close(label=name)
+        xlsx = export_for_config(cfg, db, closed_id, survey=make_survey(cfg))
+        print(f"Leg {leg['ordinal']} closed as {name!r} and exported -> {xlsx.name}")
+        print(f"Leg {leg['ordinal'] + 1} is now open.")
+    finally:
+        db.close()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def _run_reset() -> None:
-    """Interactively wipe all expedition data."""
+def _run_reset(cfg: dict, config_path: Path) -> None:
+    """Interactively wipe all expedition data for the given config."""
     from engine.reset import reset_expedition_data
 
+    db_path, output_dir, baseline = (
+        Path(cfg["db_path"]), Path(cfg["output_dir"]), Path(cfg["baseline_path"])
+    )
     print()
     print("This will permanently delete:")
-    print("  • tracker.db       — all jump, scan, and organic data")
-    print("  • output/          — all exported xlsx and csv files")
-    print("  • validation_baseline.json  — if present")
+    print(f"  • {db_path.name:<24} — all jump, scan, and organic data")
+    print(f"  • {output_dir.name + '/':<24} — all exported xlsx and csv files")
+    print(f"  • {baseline.name:<24} — if present")
     print()
-    print("config.toml will NOT be changed.")
+    print(f"{config_path.name} will NOT be changed.")
+    if (cfg.get("survey") or {}).get("csv_path"):
+        print("The survey CSV will NOT be changed.")
     print()
     answer = input("Type YES to confirm reset: ").strip()
     if answer != "YES":
@@ -416,7 +558,7 @@ def _run_reset() -> None:
         return
 
     try:
-        removed = reset_expedition_data(ROOT)
+        removed = reset_expedition_data(ROOT, db_path, output_dir, baseline)
     except OSError as exc:
         print()
         print(f"Reset failed: {exc}")
@@ -425,11 +567,11 @@ def _run_reset() -> None:
 
     print()
     if removed["db"]:
-        print("  Deleted tracker.db")
+        print(f"  Deleted {db_path.name}")
     if removed["exports"]:
-        print(f"  Deleted {removed['exports']} file(s) from output/")
+        print(f"  Deleted {removed['exports']} file(s) from {output_dir.name}/")
     if removed["baseline"]:
-        print("  Deleted validation_baseline.json")
+        print(f"  Deleted {baseline.name}")
     if not any(removed.values()):
         print("  Nothing to delete — already clean.")
     print()
@@ -437,29 +579,91 @@ def _run_reset() -> None:
     print("then launch tracker.pyw to start fresh.")
 
 
+def _show_error(title: str, message: str) -> None:
+    """Error dialog for the windowed app, which has no console to print to."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _run_configure(config_path: Path, first_run: bool = False) -> bool:
+    """Open the configuration window; True if the config was saved."""
+    from ui.config_window import ConfigWindow
+    return ConfigWindow(config_path, first_run=first_run).run()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Elite Dangerous Expedition Tracker"
+        description=f"ED Expedition Ledger {__version__}"
     )
     ap.add_argument("--cli",      action="store_true", help="Run headless (console/log output)")
     ap.add_argument("--validate", action="store_true", help="Assert invariants + check baseline")
     ap.add_argument("--snapshot", action="store_true", help="Regenerate validation_baseline.json")
     ap.add_argument("--reset",    action="store_true", help="Delete all expedition data (keeps config.toml)")
-    ap.add_argument("--config",   default=str(ROOT / "config.toml"), help="Path to config.toml")
+    ap.add_argument("--survey-rebuild", action="store_true",
+                    help="Replay stored events into the [survey] CSV")
+    ap.add_argument("--survey-resolve", nargs="+", metavar="SYSTEM",
+                    help="Set the resolution of these systems in a clustered survey CSV")
+    ap.add_argument("--as", dest="resolve_as", default="not_found", metavar="VALUE",
+                    help="Resolution for --survey-resolve: not_found (default), "
+                         "done_by_other, or clear")
+    ap.add_argument("--close-leg", metavar="NAME",
+                    help="Close the open leg under NAME, open the next, export it")
+    ap.add_argument("--configure", action="store_true", help="Open the configuration window")
+    ap.add_argument("--config",   default=str(paths.default_config_path()),
+                    help="Path to the expedition config (.toml)")
     ap.add_argument("--verbose",  action="store_true", help="Debug-level logging")
+    ap.add_argument("--version",  action="version", version=f"ED Expedition Ledger {__version__}")
     args = ap.parse_args()
 
-    to_console = args.cli or args.validate or args.snapshot or args.reset
+    to_console = bool(args.cli or args.validate or args.snapshot or args.reset
+                      or args.survey_rebuild or args.survey_resolve or args.close_leg)
     _setup_logging(verbose=args.verbose, to_console=to_console)
+    config_path = Path(args.config)
 
-    if args.reset:
-        _run_reset()
+    if args.configure:
+        _run_configure(config_path)
         return
 
-    from engine.config import load as load_cfg
-    cfg = load_cfg(Path(args.config))
+    # First run (no config yet): set up the expedition before starting the tray.
+    if not config_path.exists():
+        if to_console:
+            print(f"No config at {config_path}. Run with --configure first.")
+            sys.exit(1)
+        if not _run_configure(config_path, first_run=True):
+            return
 
-    if args.snapshot:
+    from engine.config import load as load_cfg
+    try:
+        cfg = load_cfg(config_path)
+    except Exception as exc:
+        logging.getLogger("main").exception("Could not load %s", config_path)
+        if to_console:
+            print(f"Could not load {config_path}: {exc}")
+            sys.exit(1)
+        _show_error("ED Expedition Ledger",
+                    f"Could not load the expedition config:\n{config_path}\n\n{exc}\n\n"
+                    "The configuration window will open so you can fix it.")
+        _run_configure(config_path)
+        return
+
+    if args.reset:
+        _run_reset(cfg, Path(args.config))
+        return
+
+    if args.survey_rebuild:
+        _run_survey_rebuild(cfg)
+    elif args.survey_resolve:
+        _run_survey_resolve(cfg, args.survey_resolve, args.resolve_as)
+    elif args.close_leg:
+        _run_close_leg(cfg, args.close_leg)
+    elif args.snapshot:
         _run_snapshot(cfg)
     elif args.validate:
         _run_validate(cfg)

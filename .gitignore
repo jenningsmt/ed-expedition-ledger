@@ -5,3 +5,12 @@ __pycache__/
 tracker.log
 output/
 validation_baseline.json
+output_*/
+*.tmp
+tracker.ico
+ledger.ico
+*.db-shm
+*.db-wal
+build/
+dist/
+dist-installer/
