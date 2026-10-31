@@ -29,6 +29,7 @@ waypoint.
 | `output/` | Generated leg exports land here (auto-created) |
 | `tracker.db` | SQLite database (auto-created) |
 | `tracker.log` | Rotating log (auto-created) |
+| `LICENSE` | MIT License |
 
 ---
 
@@ -764,6 +765,12 @@ config_hypiae_aim.toml --reset` deletes that config's `db_path`,
 | Waypoint not auto-closing | Confirm exact `StarSystem` string in-game; update `config.toml` |
 | `tomllib` import error | You're running Python < 3.11; upgrade or `pip install tomli` |
 | Shortcut won't launch | Re-run `make_shortcut.py`; check pythonw.exe path in the output |
+
+---
+
+## How this was built
+
+Built with AI-assisted development. I wrote the requirements, data model, and architecture rules, and directed AI coding assistants to implement them. Every change went through my review, the validation checks, and the pytest suite before release.
 
 ---
 
